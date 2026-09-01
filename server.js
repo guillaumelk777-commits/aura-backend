@@ -3,11 +3,13 @@ const cors = require('cors');
 const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
 const { Pool } = require('pg');
+const pkg = require('./package.json');
 
 const app = express();
 app.set('trust proxy', 1);
 app.use(helmet());
-app.use(cors());
+const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || 'https://guillaumelk777-commits.github.io,http://localhost:3000,http://127.0.0.1:5500').split(',').map(s=>s.trim()).filter(Boolean);
+app.use(cors({ origin: (origin, cb) => { if (!origin || ALLOWED_ORIGINS.includes(origin)) return cb(null, true); cb(new Error('Origen no permitido por CORS')); } }));
 app.use(express.json({ limit: '1mb' }));
 
 const pool = new Pool({ connectionString: process.env.DATABASE_URL });
@@ -21,7 +23,7 @@ const CONFIG = {
   ARBITER_CLOSE_VOTES: 30,
   MAX_ACTIVE_PER_USER: 5,
   SUPABASE_URL: process.env.SUPABASE_URL || 'https://saqhaofycdjlwdauzhtv.supabase.co',
-  SUPABASE_ANON_KEY: process.env.SUPABASE_ANON_KEY
+  SUPABASE_ANON_KEY: process.env.SUPABASE_ANON_KEY || 'sb_publishable_itAVUVk2JCkBjqKXSgQYrw_WsweKG1H'
 };
 
 const writeLimiter = rateLimit({ windowMs: 60 * 1000, max: 20, standardHeaders: true, legacyHeaders: false });
@@ -44,13 +46,15 @@ async function requireAuth(req, res, next) {
     });
     const user = await r.json().catch(() => null);
     if (!r.ok || !user?.id) {
-      return res.status(401).json({ error: 'Sesión expirada o token inválido', code: 'INVALID_TOKEN' });
+      console.warn('Supabase rechazó el access token. status=', r.status);
+      return res.status(401).json({ error: 'Sesión expirada o token inválido. Volvé a iniciar sesión con Google o Apple.', code: 'INVALID_TOKEN' });
     }
     req.userId = user.id;
     req.authUser = user;
     next();
   } catch (err) {
     console.error('Supabase token validation:', err.message);
+    console.error('SUPABASE_URL:', CONFIG.SUPABASE_URL, 'SUPABASE_ANON_KEY configured:', Boolean(CONFIG.SUPABASE_ANON_KEY));
     return res.status(503).json({ error: 'No se pudo validar la sesión con Supabase.', code: 'AUTH_SERVICE_UNAVAILABLE' });
   }
 }
@@ -59,14 +63,39 @@ const clean = s => String(s ?? '').trim();
 const participantIds = b => b.mode === 'local' ? [b.local_participant_a, b.local_participant_b] : [b.creator_id, b.opponent_id];
 const canResolve = (a, o) => a + o >= CONFIG.MIN_VOTES && Math.abs(a - o) >= CONFIG.MIN_DIFF;
 
-async function expireLocalBattles(client = pool) {
-  const result = await client.query(`SELECT * FROM battles WHERE mode='local' AND status='active' AND local_closes_at <= NOW() FOR UPDATE`);
-  for (const b of result.rows) {
-    if (canResolve(b.votes_creator, b.votes_opponent)) {
-      await finishBattle(client, b, b.votes_creator > b.votes_opponent ? b.local_participant_a : b.local_participant_b);
-    } else {
-      await client.query(`UPDATE battles SET status='cancelled', closed_at=NOW() WHERE id=$1`, [b.id]);
+// Traduce errores comunes de Postgres a mensajes entendibles para el usuario.
+function friendlyDbError(e) {
+  if (e.code === '23505') return 'Ya existe un registro con esos datos (conflicto de unicidad).';
+  if (e.code === '23514') return 'Los datos no cumplen las reglas de la batalla (revisá título, participantes o costo).';
+  if (e.code === '23503') return 'Referencia inválida: alguno de los datos indicados no existe.';
+  return e.message;
+}
+
+// IMPORTANTE: esta función corre dentro de su propia transacción (BEGIN/COMMIT)
+// para que el FOR UPDATE realmente bloquee las filas mientras se resuelven.
+// Antes se ejecutaba con pool.query() suelto, que Postgres trata como una
+// transacción implícita de una sola sentencia: el bloqueo se liberaba apenas
+// terminaba el SELECT, así que dos llamadas concurrentes (el setInterval de
+// 60s y, por ejemplo, un GET /api/battles simultáneo) podían tomar la misma
+// batalla vencida y acreditar el premio de Aura dos veces.
+async function expireLocalBattles() {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const result = await client.query(`SELECT * FROM battles WHERE mode='local' AND status='active' AND local_closes_at <= NOW() FOR UPDATE`);
+    for (const b of result.rows) {
+      if (canResolve(b.votes_creator, b.votes_opponent)) {
+        await finishBattle(client, b, b.votes_creator > b.votes_opponent ? b.local_participant_a : b.local_participant_b);
+      } else {
+        await client.query(`UPDATE battles SET status='cancelled', closed_at=NOW() WHERE id=$1`, [b.id]);
+      }
     }
+    await client.query('COMMIT');
+  } catch (e) {
+    await client.query('ROLLBACK');
+    console.error('expireLocalBattles transaction failed:', e.message);
+  } finally {
+    client.release();
   }
 }
 
@@ -83,7 +112,7 @@ async function finishBattle(client, b, winnerId) {
 
 setInterval(() => expireLocalBattles().catch(e => console.error('expireLocalBattles:', e)), 60000);
 
-app.get('/', (req, res) => res.json({ ok: true, service: 'AURA STAR API', version: '3.1' }));
+app.get('/', (req, res) => res.json({ ok: true, service: 'AURA STAR API', version: pkg.version }));
 
 // Sincronizar/Crear Usuario
 app.post('/api/users', writeLimiter, requireAuth, async (req, res) => {
@@ -249,7 +278,7 @@ app.post('/api/battles', writeLimiter, requireAuth, async (req, res) => {
     res.status(201).json(r.rows[0]);
   } catch (e) {
     await client.query('ROLLBACK');
-    res.status(400).json({ error: e.message });
+    res.status(400).json({ error: friendlyDbError(e) });
   } finally { client.release(); }
 });
 
@@ -281,7 +310,7 @@ app.post('/api/battles/:id/join', writeLimiter, requireAuth, async (req, res) =>
     res.json({ message: '¡Te uniste a la batalla!', id: b.id });
   } catch (e) {
     await client.query('ROLLBACK');
-    res.status(400).json({ error: e.message });
+    res.status(400).json({ error: friendlyDbError(e) });
   } finally { client.release(); }
 });
 
@@ -355,7 +384,7 @@ app.post('/api/battles/:id/arbiter-close', writeLimiter, requireAuth, async (req
     res.json({ message: 'Batalla cerrada y resuelta exitosamente por el árbitro.' });
   } catch (e) {
     await client.query('ROLLBACK');
-    res.status(400).json({ error: e.message });
+    res.status(400).json({ error: friendlyDbError(e) });
   } finally { client.release(); }
 });
 
@@ -376,6 +405,17 @@ app.post('/api/battles/:id/report', writeLimiter, requireAuth, async (req, res) 
   } finally { client.release(); }
 });
 
+// Plataforma de pagos — endpoint preparado, sin cobro real hasta configurar el proveedor.
+app.post('/api/payments/create-checkout', writeLimiter, requireAuth, async (req, res) => {
+  const { package_id } = req.body || {};
+  const packages = { starter: 50, plus: 120, pro: 300, mega: 700 };
+  if (!packages[package_id]) return res.status(400).json({ error: 'Paquete de puntos inválido.' });
+  if (!process.env.PAYMENTS_CHECKOUT_URL) {
+    return res.status(503).json({ error: 'La plataforma de pagos todavía no está configurada. No se realizó ningún cobro.', code: 'PAYMENTS_NOT_CONFIGURED' });
+  }
+  return res.status(501).json({ error: 'Proveedor de pagos pendiente de integración segura.', code: 'PAYMENTS_PENDING' });
+});
+
 // Eliminar cuenta propia
 app.delete('/api/users/:id', requireAuth, async (req, res) => {
   if (req.params.id !== req.userId) return res.status(403).json({ error: 'Operación no autorizada.' });
@@ -386,4 +426,4 @@ app.delete('/api/users/:id', requireAuth, async (req, res) => {
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`AURA STAR API v3.1 (JWT Auth) escuchando en puerto ${PORT}`));
+app.listen(PORT, () => console.log(`AURA STAR API v${pkg.version} escuchando en puerto ${PORT}`));
