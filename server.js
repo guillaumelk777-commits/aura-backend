@@ -1,349 +1,336 @@
 const express = require('express');
 const cors = require('cors');
-const helmet = require('helmet');
-const rateLimit = require('express-rate-limit');
 const { Pool } = require('pg');
 
 const app = express();
-app.set('trust proxy', 1);
-app.use(helmet());
 app.use(cors());
 app.use(express.json({ limit: '1mb' }));
-
 const pool = new Pool({ connectionString: process.env.DATABASE_URL });
-pool.on('error', (err) => console.error('Error inesperado en el pool de Postgres', err));
 
-const CATEGORIES = ['gaming', 'freestyle', 'dance'];
-const REPORT_HIDE_THRESHOLD = 3;
-const DAILY_GIFT_LIMIT_PER_RECIPIENT = 50;
-const AGE_BRACKETS = ['13_17', '18_plus'];
-const POINTS_PER_AD = 5;
-const DAILY_AD_POINTS_CAP = 60;
-const ADS_SSV_SECRET = process.env.ADS_SSV_SECRET;
-
-const PRODUCTS = {
-  'aura_points_small': { points: 100, store_price_usd: 1.99 },
-  'aura_points_medium': { points: 300, store_price_usd: 4.99 },
-  'aura_points_large': { points: 700, store_price_usd: 9.99 },
+const CONFIG = {
+  LOCAL_COST: Number(process.env.LOCAL_BATTLE_COST || 20),
+  WIN_REWARD: Number(process.env.WIN_REWARD || 20),
+  LOSS_PENALTY: Number(process.env.LOSS_PENALTY || 5),
+  MIN_VOTES: 10,
+  MIN_DIFF: 3,
+  ARBITER_CLOSE_VOTES: 30,
+  LOCAL_DURATION_HOURS: 2,
+  MAX_ACTIVE_PER_USER: 5
 };
 
-const REVENUECAT_WEBHOOK_SECRET = process.env.REVENUECAT_WEBHOOK_SECRET;
+app.get('/', (req, res) => res.json({ ok: true, service: 'AURA STAR API', version: '3.2' }));
+const clean = s => String(s ?? '').trim();
+const participantIds = b => b.mode === 'local'
+  ? [b.local_participant_a, b.local_participant_b]
+  : [b.creator_id, b.opponent_id];
+const canResolve = (a, o) => a + o >= CONFIG.MIN_VOTES && Math.abs(a - o) >= CONFIG.MIN_DIFF;
 
-const writeLimiter = rateLimit({ windowMs: 60 * 1000, max: 20, standardHeaders: true, legacyHeaders: false });
-const voteLimiter = rateLimit({ windowMs: 60 * 1000, max: 30, standardHeaders: true, legacyHeaders: false });
+async function finishBattle(client, b, winnerId) {
+  if (!winnerId) return;
+  const [a, o] = participantIds(b);
+  const loserId = winnerId === a ? o : a;
 
-function isValidId(v) {
-  return typeof v === 'string' && v.trim().length > 0 && v.length <= 100;
+  await client.query(`UPDATE users SET aura_points = aura_points + $1 WHERE id = $2`, [CONFIG.WIN_REWARD, winnerId]);
+  if (loserId) {
+    await client.query(`UPDATE users SET aura_points = GREATEST(0, aura_points - $1) WHERE id = $2`, [CONFIG.LOSS_PENALTY, loserId]);
+  }
+  await client.query(
+    `UPDATE battles SET status='completed', winner_id=$1, closed_at=NOW() WHERE id=$2 AND status='active'`,
+    [winnerId, b.id]
+  );
 }
 
-app.get('/', (req, res) => res.json({ app: 'AURA', status: 'ok', message: '⚡ API de AURA funcionando correctamente' }));
-
-app.post('/api/users', writeLimiter, async (req, res) => {
-  const { id, username, age_bracket } = req.body || {};
-  if (!isValidId(id)) return res.status(400).json({ error: 'id es obligatorio' });
-  const cleanUsername = typeof username === 'string' ? username.trim().slice(0, 40) : null;
-  if (age_bracket && !AGE_BRACKETS.includes(age_bracket)) {
-    return res.status(400).json({ error: 'age_bracket inválido' });
+async function expireLocalBattles(){
+  const client = await pool.connect();
+  try{
+    await client.query('BEGIN');
+    const result = await client.query(`SELECT * FROM battles WHERE mode='local' AND status='active' AND local_closes_at<=NOW() FOR UPDATE`);
+    for(const b of result.rows){
+      if(canResolve(b.votes_creator,b.votes_opponent)){
+        const winner = b.votes_creator > b.votes_opponent ? b.local_participant_a : b.local_participant_b;
+        await finishBattle(client, b, winner);
+      } else {
+        await client.query(`UPDATE battles SET status='cancelled', closed_at=NOW() WHERE id=$1 AND status='active'`, [b.id]);
+      }
+    }
+    await client.query('COMMIT');
+  } catch(e) {
+    await client.query('ROLLBACK');
+    throw e;
+  } finally {
+    client.release();
   }
+}
+setInterval(() => expireLocalBattles().catch(e => console.error('local expiry:', e)), 60000);
+
+app.post('/api/users', async (req, res) => {
   try {
-    const q = await pool.query(
-      `INSERT INTO users(id, username, age_bracket) VALUES($1, $2, $3)
-       ON CONFLICT(id) DO UPDATE SET
-         username = COALESCE(NULLIF($2, ''), users.username),
-         age_bracket = COALESCE($3, users.age_bracket)
-       RETURNING id, username, aura_points, giftable_points, age_bracket, is_banned, created_at`,
-      [id, cleanUsername, age_bracket || null]
+    const id = clean(req.body.id);
+    const username = clean(req.body.username);
+    const ageBracket = clean(req.body.age_bracket) || '18_plus';
+    if (!id || !username) return res.status(400).json({ error: 'ID y nombre son obligatorios.' });
+    if (!['13_17', '18_plus'].includes(ageBracket)) return res.status(400).json({ error: 'Rango de edad inválido.' });
+
+    const r = await pool.query(
+      `INSERT INTO users(id,username,age_bracket) VALUES($1,$2,$3)
+       ON CONFLICT(id) DO UPDATE SET username=EXCLUDED.username
+       RETURNING *`,
+      [id, username, ageBracket]
     );
-    res.json(q.rows[0]);
-  } catch (e) { res.status(500).json({ error: e.message }); }
+    res.json(r.rows[0]);
+  } catch (e) {
+    res.status(400).json({ error: e.code === '23505' ? 'Ese nombre de usuario ya está usado.' : e.message });
+  }
 });
 
 app.get('/api/users/ranking', async (req, res) => {
   try {
-    const q = await pool.query(
-      `SELECT id, username, aura_points FROM users
-       WHERE deleted_at IS NULL AND is_banned = false
-       ORDER BY aura_points DESC NULLS LAST LIMIT 50`
-    );
-    res.json(q.rows);
+    const r = await pool.query(`
+      SELECT id,username,aura_points,
+      (SELECT COUNT(*) FROM battles b WHERE b.status='completed' AND b.winner_id=u.id) battles_won
+      FROM users u
+      WHERE deleted_at IS NULL AND is_banned=false
+      ORDER BY aura_points DESC LIMIT 100`);
+    res.json(r.rows);
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 app.get('/api/users/:id', async (req, res) => {
   try {
-    const q = await pool.query(
-      'SELECT id, username, aura_points, created_at FROM users WHERE id=$1 AND deleted_at IS NULL',
-      [req.params.id]
-    );
-    if (!q.rows[0]) return res.status(404).json({ error: 'Usuario no encontrado' });
-    res.json(q.rows[0]);
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
-
-app.delete('/api/users/:id', async (req, res) => {
-  try {
-    const q = await pool.query(
-      `UPDATE users SET username = NULL, is_banned = true, deleted_at = NOW()
-       WHERE id = $1 AND deleted_at IS NULL RETURNING id`,
-      [req.params.id]
-    );
-    if (!q.rows[0]) return res.status(404).json({ error: 'Usuario no encontrado' });
-    res.json({ message: 'Cuenta eliminada' });
+    const r = await pool.query(`
+      SELECT u.*,
+      (SELECT COUNT(*) FROM battles b WHERE b.status='completed' AND b.winner_id=u.id) battles_won,
+      (SELECT COUNT(*) FROM battles b WHERE b.status IN('completed','cancelled')
+        AND (b.creator_id=u.id OR b.opponent_id=u.id OR b.local_participant_a=u.id OR b.local_participant_b=u.id)) battles_played
+      FROM users u WHERE u.id=$1 AND u.deleted_at IS NULL`, [req.params.id]);
+    if (!r.rows[0]) return res.status(404).json({ error: 'Usuario no encontrado.' });
+    res.json(r.rows[0]);
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 app.get('/api/battles', async (req, res) => {
-  const limit = Math.min(parseInt(req.query.limit, 10) || 30, 50);
   try {
-    const q = await pool.query(
-      `SELECT * FROM battles WHERE status='active' AND hidden = false ORDER BY created_at DESC LIMIT $1`,
-      [limit]
-    );
-    res.json(q.rows);
+    await expireLocalBattles();
+    const r = await pool.query(`
+      SELECT b.*,u1.username creator_name,u2.username opponent_name,
+             la.username local_a_name,lb.username local_b_name
+      FROM battles b
+      LEFT JOIN users u1 ON u1.id=b.creator_id
+      LEFT JOIN users u2 ON u2.id=b.opponent_id
+      LEFT JOIN users la ON la.id=b.local_participant_a
+      LEFT JOIN users lb ON lb.id=b.local_participant_b
+      WHERE b.status='active' AND b.hidden=false
+      ORDER BY b.created_at DESC LIMIT 100`);
+    res.json(r.rows);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.get('/api/battles/local/search', async (req, res) => {
+  try {
+    await expireLocalBattles();
+    const q = clean(req.query.q);
+    if (q.length < 2) return res.json([]);
+    const r = await pool.query(`
+      SELECT b.id,b.title,b.category,b.theme,b.status,b.votes_creator,b.votes_opponent,
+             b.local_closes_at,b.created_at,ua.username local_a_name,ub.username local_b_name
+      FROM battles b
+      JOIN users ua ON ua.id=b.local_participant_a
+      JOIN users ub ON ub.id=b.local_participant_b
+      WHERE b.mode='local' AND b.status='active' AND b.hidden=false
+        AND b.title ILIKE '%'||$1||'%'
+      ORDER BY b.created_at DESC LIMIT 30`, [q]);
+    res.json(r.rows);
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 app.get('/api/battles/:id', async (req, res) => {
   try {
-    const q = await pool.query('SELECT * FROM battles WHERE id=$1', [req.params.id]);
-    if (!q.rows[0]) return res.status(404).json({ error: 'Batalla no encontrada' });
-    res.json(q.rows[0]);
+    await expireLocalBattles();
+    const r = await pool.query(`
+      SELECT b.*,u1.username creator_name,u2.username opponent_name,
+             la.username local_a_name,lb.username local_b_name
+      FROM battles b
+      LEFT JOIN users u1 ON u1.id=b.creator_id
+      LEFT JOIN users u2 ON u2.id=b.opponent_id
+      LEFT JOIN users la ON la.id=b.local_participant_a
+      LEFT JOIN users lb ON lb.id=b.local_participant_b
+      WHERE b.id=$1`, [req.params.id]);
+    if (!r.rows[0]) return res.status(404).json({ error: 'Batalla no encontrada.' });
+    res.json(r.rows[0]);
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-app.post('/api/battles', writeLimiter, async (req, res) => {
-  const { creator_id, category, title, media_url_creator } = req.body || {};
-  if (!isValidId(creator_id) || !category || !title) {
-    return res.status(400).json({ error: 'creator_id, category y title son obligatorios' });
-  }
-  if (!CATEGORIES.includes(category)) return res.status(400).json({ error: 'Categoría inválida' });
-  const cleanTitle = String(title).trim().slice(0, 80);
-  if (!cleanTitle) return res.status(400).json({ error: 'El título no puede estar vacío' });
-  if (media_url_creator && !/^https:\/\//i.test(media_url_creator)) {
-    return res.status(400).json({ error: 'URL de media inválida' });
-  }
-  try {
-    const user = await pool.query('SELECT is_banned FROM users WHERE id=$1 AND deleted_at IS NULL', [creator_id]);
-    if (!user.rows[0]) return res.status(400).json({ error: 'Usuario no registrado' });
-    if (user.rows[0].is_banned) return res.status(403).json({ error: 'Cuenta suspendida' });
-
-    const active = await pool.query("SELECT COUNT(*) FROM battles WHERE creator_id=$1 AND status='active'", [creator_id]);
-    if (Number(active.rows[0].count) >= 5) return res.status(400).json({ error: 'Límite alcanzado: Máximo 5 batallas activas simultáneas.' });
-
-    const q = await pool.query(
-      `INSERT INTO battles(creator_id, category, title, media_url_creator, status, votes_creator, votes_opponent)
-       VALUES($1, $2, $3, $4, 'active', 0, 0) RETURNING *`,
-      [creator_id, category, cleanTitle, media_url_creator || null]
-    );
-    res.status(201).json(q.rows[0]);
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
-
-app.post('/api/battles/:id/join', writeLimiter, async (req, res) => {
-  const { opponent_id, media_url_opponent } = req.body || {};
-  if (!isValidId(opponent_id)) return res.status(400).json({ error: 'opponent_id es obligatorio' });
-  if (media_url_opponent && !/^https:\/\//i.test(media_url_opponent)) {
-    return res.status(400).json({ error: 'URL de media inválida' });
-  }
+app.post('/api/battles', async (req, res) => {
+  const { creator_id, mode='video', category, title, theme, media_url_creator,
+          local_participant_a, local_participant_b, local_neutral=false } = req.body;
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
-    const user = await client.query('SELECT is_banned, age_bracket FROM users WHERE id=$1 AND deleted_at IS NULL', [opponent_id]);
-    if (!user.rows[0]) throw Error('Usuario no registrado.');
-    if (user.rows[0].is_banned) throw Error('Cuenta suspendida.');
+    const c = clean(creator_id), t = clean(title), m = clean(mode), cat = clean(category) || 'other';
+    const u = await client.query(`SELECT * FROM users WHERE id=$1 AND deleted_at IS NULL AND is_banned=false`, [c]);
+    if (!u.rows[0]) throw Error('Usuario creador no encontrado.');
 
-    const q = await client.query('SELECT * FROM battles WHERE id=$1 FOR UPDATE', [req.params.id]);
-    const b = q.rows[0];
-    if (!b || b.status !== 'active') throw Error('La batalla no está activa o no existe.');
-    if (b.creator_id === opponent_id) throw Error('No puedes unirte a tu propia batalla.');
-    if (b.opponent_id) throw Error('La batalla ya tiene oponente.');
+    const active = await client.query(`
+      SELECT COUNT(*) FROM battles WHERE status='active'
+      AND (creator_id=$1 OR opponent_id=$1 OR local_participant_a=$1 OR local_participant_b=$1)`, [c]);
+    if (Number(active.rows[0].count) >= CONFIG.MAX_ACTIVE_PER_USER) {
+      throw Error(`Límite alcanzado: máximo ${CONFIG.MAX_ACTIVE_PER_USER} batallas activas.`);
+    }
+    if (!['video','audio','photo','local'].includes(m)) throw Error('Tipo de batalla inválido.');
+    if (!t) throw Error('El nombre de la batalla es obligatorio.');
 
-    const creator = await client.query('SELECT age_bracket FROM users WHERE id=$1', [b.creator_id]);
-    if (creator.rows[0]?.age_bracket && user.rows[0].age_bracket && creator.rows[0].age_bracket !== user.rows[0].age_bracket) {
-      throw Error('Esta batalla es de otra franja etaria.');
+    if (m === 'local') {
+      const a = clean(local_participant_a), b = clean(local_participant_b);
+      if (!a || !b || a === b) throw Error('Las dos personas que compiten son obligatorias y deben ser distintas.');
+      if (!local_neutral && c !== a && c !== b) throw Error('Si no sos neutral, tenés que ser uno de los dos participantes.');
+      if (local_neutral && (c === a || c === b)) throw Error('Una batalla neutral requiere que el organizador no sea competidor.');
+
+      const ps = await client.query(`
+        SELECT id,age_bracket FROM users
+        WHERE id=ANY($1) AND deleted_at IS NULL AND is_banned=false`, [[a,b]]);
+      if (ps.rows.length !== 2) throw Error('Uno de los participantes no existe.');
+      if (ps.rows[0].age_bracket !== ps.rows[1].age_bracket) throw Error('Los dos participantes deben pertenecer al mismo rango de edad.');
+
+      const bal = await client.query(`SELECT giftable_points FROM users WHERE id=$1 FOR UPDATE`, [c]);
+      if (Number(bal.rows[0].giftable_points) < CONFIG.LOCAL_COST) {
+        throw Error(`Necesitás ${CONFIG.LOCAL_COST} puntos regalables para crear esta batalla.`);
+      }
+      await client.query(`UPDATE users SET giftable_points=giftable_points-$1 WHERE id=$2`, [CONFIG.LOCAL_COST, c]);
+
+      const r = await client.query(`
+        INSERT INTO battles(
+          mode,creator_id,local_participant_a,local_participant_b,local_neutral,
+          entry_cost_points,local_closes_at,category,title,theme
+        ) VALUES('local',$1,$2,$3,$4,$5,NOW()+($6 * INTERVAL '1 hour'),$7,$8,$9)
+        RETURNING *`,
+        [c,a,b,!!local_neutral,CONFIG.LOCAL_COST,CONFIG.LOCAL_DURATION_HOURS,cat,t,clean(theme)||null]
+      );
+      await client.query('COMMIT');
+      return res.status(201).json(r.rows[0]);
     }
 
-    const r = await client.query('UPDATE battles SET opponent_id=$1, media_url_opponent=$2 WHERE id=$3 RETURNING *', [opponent_id, media_url_opponent || null, req.params.id]);
+    if (!['video','audio','photo'].includes(m)) throw Error('Tipo inválido.');
+    if (!media_url_creator) throw Error('La primera participación necesita un archivo.');
+    const r = await client.query(`
+      INSERT INTO battles(mode,creator_id,category,title,theme,media_url_creator)
+      VALUES($1,$2,$3,$4,$5,$6) RETURNING *`,
+      [m,c,cat,t,clean(theme)||null,clean(media_url_creator)]);
     await client.query('COMMIT');
-    res.json(r.rows[0]);
-  } catch (e) { await client.query('ROLLBACK'); res.status(400).json({ error: e.message }); }
-  finally { client.release(); }
+    res.status(201).json(r.rows[0]);
+  } catch (e) {
+    await client.query('ROLLBACK');
+    res.status(400).json({ error: e.message });
+  } finally { client.release(); }
 });
 
-app.post('/api/battles/:id/vote', voteLimiter, async (req, res) => {
-  const battleId = req.params.id;
-  const { voter_id, voted_user_id } = req.body || {};
+app.post('/api/battles/:id/join', async (req, res) => {
+  const { opponent_id, media_url } = req.body;
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
-    const user = await client.query('SELECT is_banned FROM users WHERE id=$1 AND deleted_at IS NULL', [voter_id]);
-    if (!user.rows[0]) throw Error('Usuario no registrado.');
-    if (user.rows[0].is_banned) throw Error('Cuenta suspendida.');
+    const r = await client.query(`SELECT * FROM battles WHERE id=$1 FOR UPDATE`, [req.params.id]);
+    const b = r.rows[0];
+    if (!b || b.status !== 'active') throw Error('La batalla no está activa.');
+    if (b.mode === 'local') throw Error('Las batallas locales ya tienen sus dos participantes.');
+    const oid = clean(opponent_id);
+    if (!oid || oid === b.creator_id) throw Error('Contrincante inválido.');
+    const u = await client.query(`SELECT * FROM users WHERE id=$1 AND deleted_at IS NULL AND is_banned=false`, [oid]);
+    if (!u.rows[0]) throw Error('Usuario no encontrado.');
+    const c = await client.query(`SELECT age_bracket FROM users WHERE id=$1`, [b.creator_id]);
+    if (c.rows[0].age_bracket !== u.rows[0].age_bracket) throw Error('Los dos participantes deben pertenecer al mismo rango de edad.');
+    if (!['video','audio','photo'].includes(b.mode)) throw Error('Modo no válido.');
+    if (!media_url) throw Error('Falta el archivo del segundo participante.');
+    await client.query(`UPDATE battles SET opponent_id=$1,media_url_opponent=$2 WHERE id=$3`, [oid,clean(media_url),b.id]);
+    await client.query('COMMIT');
+    res.json({ message:'¡Te uniste a la batalla!', id:b.id });
+  } catch (e) {
+    await client.query('ROLLBACK');
+    res.status(400).json({ error:e.message });
+  } finally { client.release(); }
+});
 
-    const q = await client.query('SELECT * FROM battles WHERE id=$1 FOR UPDATE', [battleId]);
-    const b = q.rows[0];
-    if (!b || b.status !== 'active') throw Error('La batalla no está activa o no existe.');
-    if (b.hidden) throw Error('Esta batalla está en revisión.');
-    if (!voter_id || !voted_user_id) throw Error('Faltan datos del voto.');
-    if (b.creator_id === voter_id || b.opponent_id === voter_id) throw Error('No puedes votar en tu propia batalla.');
-    if (voted_user_id !== b.creator_id && voted_user_id !== b.opponent_id) throw Error('Participante inválido.');
+app.post('/api/battles/:id/vote', async (req, res) => {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const r = await client.query(`SELECT * FROM battles WHERE id=$1 FOR UPDATE`, [req.params.id]);
+    const b = r.rows[0];
+    if (!b || b.status !== 'active') throw Error('La batalla no está activa.');
+    if (b.mode !== 'local' && !b.opponent_id) throw Error('La batalla todavía espera contrincante.');
 
-    const prior = await client.query('SELECT 1 FROM votes WHERE battle_id=$1 AND voter_id=$2', [battleId, voter_id]);
-    if (prior.rowCount) throw Error('Ya votaste en esta batalla.');
+    const voter = clean(req.body.voter_id), target = clean(req.body.voted_user_id);
+    const [pa,pb] = participantIds(b);
+    if (!voter) throw Error('Votante no identificado.');
+    if (voter === pa || voter === pb) throw Error('No podés votar tu propia batalla.');
+    if (b.mode === 'local' && b.local_neutral && voter === b.creator_id) throw Error('El árbitro no puede votar.');
+    if (target !== pa && target !== pb) throw Error('Voto inválido.');
 
-    await client.query('INSERT INTO votes(battle_id, voter_id, voted_user_id) VALUES($1, $2, $3)', [battleId, voter_id, voted_user_id]);
-    const vc = Number(b.votes_creator || 0) + (voted_user_id === b.creator_id ? 1 : 0);
-    const vo = Number(b.votes_opponent || 0) + (voted_user_id === b.opponent_id ? 1 : 0);
-    await client.query('UPDATE battles SET votes_creator=$1, votes_opponent=$2 WHERE id=$3', [vc, vo, battleId]);
+    await client.query(`INSERT INTO votes(battle_id,voter_id,voted_user_id) VALUES($1,$2,$3)`, [b.id,voter,target]);
+    const a = b.votes_creator + (target === pa ? 1 : 0);
+    const o = b.votes_opponent + (target === pb ? 1 : 0);
+    await client.query(`UPDATE battles SET votes_creator=$1,votes_opponent=$2 WHERE id=$3`, [a,o,b.id]);
 
-    const total = vc + vo, diff = Math.abs(vc - vo);
-    let completed = false, winner_id = null;
-
-    if (total >= 10 && diff >= 3 && b.opponent_id) {
-      winner_id = vc > vo ? b.creator_id : b.opponent_id;
-      const loser = winner_id === b.creator_id ? b.opponent_id : b.creator_id;
-      await client.query('UPDATE users SET aura_points=aura_points+20 WHERE id=$1', [winner_id]);
-      await client.query('UPDATE users SET aura_points=GREATEST(0, aura_points-5) WHERE id=$1', [loser]);
-      await client.query("UPDATE battles SET status='completed', winner_id=$1, closed_at=NOW() WHERE id=$2", [winner_id, battleId]);
+    let completed = false;
+    if (canResolve(a,o)) {
+      await finishBattle(client,b,a > o ? pa : pb);
       completed = true;
     }
     await client.query('COMMIT');
-    res.json({ message: 'Voto registrado correctamente.', votes_creator: vc, votes_opponent: vo, total_votes: total, completed, winner_id });
-  } catch (e) { await client.query('ROLLBACK'); res.status(400).json({ error: e.message }); }
-  finally { client.release(); }
+    res.json({ message:'¡Voto registrado!', completed, votes_creator:a, votes_opponent:o });
+  } catch (e) {
+    await client.query('ROLLBACK');
+    res.status(400).json({ error:e.code === '23505' ? 'Ya votaste en esta batalla.' : e.message });
+  } finally { client.release(); }
 });
 
-app.post('/api/battles/:id/report', writeLimiter, async (req, res) => {
-  const battleId = req.params.id;
-  const { reporter_id, reason } = req.body || {};
-  if (!isValidId(reporter_id) || !reason || !String(reason).trim()) {
-    return res.status(400).json({ error: 'reporter_id y reason son obligatorios' });
-  }
-  const cleanReason = String(reason).trim().slice(0, 300);
+app.post('/api/battles/:id/arbiter-close', async (req, res) => {
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
-    const b = await client.query('SELECT id FROM battles WHERE id=$1 FOR UPDATE', [battleId]);
-    if (!b.rows[0]) throw Error('Batalla no encontrada.');
-
-    await client.query(
-      'INSERT INTO reports(battle_id, reporter_id, reason) VALUES($1, $2, $3) ON CONFLICT (battle_id, reporter_id) DO NOTHING',
-      [battleId, reporter_id, cleanReason]
-    );
-    const r = await client.query(
-      `UPDATE battles SET report_count = report_count + 1,
-         hidden = (report_count + 1 >= $2)
-       WHERE id = $1 RETURNING report_count, hidden`,
-      [battleId, REPORT_HIDE_THRESHOLD]
-    );
-    await client.query('COMMIT');
-    res.json({ message: 'Reporte enviado. Gracias por ayudarnos a mantener AURA segura.', hidden: r.rows[0].hidden });
-  } catch (e) { await client.query('ROLLBACK'); res.status(400).json({ error: e.message }); }
-  finally { client.release(); }
-});
-
-app.post('/api/webhooks/revenuecat', async (req, res) => {
-  const providedSecret = req.header('Authorization');
-  if (!REVENUECAT_WEBHOOK_SECRET || providedSecret !== `Bearer ${REVENUECAT_WEBHOOK_SECRET}`) {
-    return res.status(401).json({ error: 'No autorizado' });
-  }
-  const event = req.body?.event;
-  if (!event || event.type !== 'INITIAL_PURCHASE' && event.type !== 'NON_RENEWING_PURCHASE') {
-    return res.json({ ignored: true });
-  }
-  const userId = event.app_user_id;
-  const productId = event.product_id;
-  const transactionId = String(event.transaction_id || event.id);
-  const store = event.store === 'PLAY_STORE' ? 'play_store' : 'app_store';
-  const product = PRODUCTS[productId];
-  if (!isValidId(userId) || !product) return res.status(400).json({ error: 'Datos de evento inválidos' });
-
-  try {
-    const existing = await pool.query('SELECT 1 FROM purchases WHERE transaction_id=$1', [transactionId]);
-    if (existing.rowCount) return res.json({ message: 'Ya procesada' });
-
-    await pool.query('BEGIN');
-    await pool.query(
-      'INSERT INTO purchases(user_id, product_id, store, transaction_id, points_credited) VALUES($1,$2,$3,$4,$5)',
-      [userId, productId, store, transactionId, product.points]
-    );
-    await pool.query('UPDATE users SET giftable_points = giftable_points + $1 WHERE id=$2', [product.points, userId]);
-    await pool.query('COMMIT');
-    res.json({ message: 'Puntos acreditados', points_credited: product.points });
-  } catch (e) { await pool.query('ROLLBACK'); res.status(500).json({ error: e.message }); }
-});
-
-app.post('/api/gifts', writeLimiter, async (req, res) => {
-  const { sender_id, recipient_id, points } = req.body || {};
-  const amount = Number(points);
-  if (!isValidId(sender_id) || !isValidId(recipient_id) || !Number.isInteger(amount) || amount <= 0) {
-    return res.status(400).json({ error: 'Datos de regalo inválidos' });
-  }
-  if (sender_id === recipient_id) return res.status(400).json({ error: 'No podés regalarte puntos a vos mismo' });
-
-  const client = await pool.connect();
-  try {
-    await client.query('BEGIN');
-    const sender = await client.query('SELECT giftable_points, is_banned FROM users WHERE id=$1 FOR UPDATE', [sender_id]);
-    if (!sender.rows[0]) throw Error('Remitente no encontrado.');
-    if (sender.rows[0].is_banned) throw Error('Cuenta suspendida.');
-    if (sender.rows[0].giftable_points < amount) throw Error('No tenés suficientes puntos para regalar.');
-
-    const recipient = await client.query('SELECT 1 FROM users WHERE id=$1 AND deleted_at IS NULL', [recipient_id]);
-    if (!recipient.rows[0]) throw Error('Destinatario no encontrado.');
-
-    const today = await client.query(
-      `SELECT COALESCE(SUM(points),0) AS total FROM gifts
-       WHERE sender_id=$1 AND recipient_id=$2 AND created_at >= date_trunc('day', NOW())`,
-      [sender_id, recipient_id]
-    );
-    if (Number(today.rows[0].total) + amount > DAILY_GIFT_LIMIT_PER_RECIPIENT) {
-      throw Error(`Superaste el límite diario de ${DAILY_GIFT_LIMIT_PER_RECIPIENT} puntos para este destinatario.`);
+    const r = await client.query(`SELECT * FROM battles WHERE id=$1 FOR UPDATE`, [req.params.id]);
+    const b = r.rows[0];
+    if (!b || b.status !== 'active' || b.mode !== 'local' || !b.local_neutral) {
+      throw Error('Solo el árbitro de una batalla local puede cerrarla.');
     }
-
-    await client.query('UPDATE users SET giftable_points = giftable_points - $1 WHERE id=$2', [amount, sender_id]);
-    await client.query('UPDATE users SET aura_points = aura_points + $1 WHERE id=$2', [amount, recipient_id]);
-    await client.query('INSERT INTO gifts(sender_id, recipient_id, points) VALUES($1,$2,$3)', [sender_id, recipient_id, amount]);
+    if (clean(req.body.arbiter_id) !== b.creator_id) throw Error('No sos el árbitro de esta batalla.');
+    const total = b.votes_creator + b.votes_opponent;
+    const diff = Math.abs(b.votes_creator - b.votes_opponent);
+    if (total < CONFIG.ARBITER_CLOSE_VOTES || diff < CONFIG.MIN_DIFF) {
+      throw Error(`Para cerrar manualmente se necesitan ${CONFIG.ARBITER_CLOSE_VOTES} votos y diferencia de ${CONFIG.MIN_DIFF}.`);
+    }
+    const [pa,pb] = participantIds(b);
+    await finishBattle(client,b,b.votes_creator > b.votes_opponent ? pa : pb);
     await client.query('COMMIT');
-    res.json({ message: 'Puntos regalados correctamente.' });
-  } catch (e) { await client.query('ROLLBACK'); res.status(400).json({ error: e.message }); }
-  finally { client.release(); }
+    res.json({ message:'Batalla cerrada por el árbitro.' });
+  } catch (e) {
+    await client.query('ROLLBACK');
+    res.status(400).json({ error:e.message });
+  } finally { client.release(); }
 });
 
-app.get('/api/ads/reward', async (req, res) => {
-  const { user_id, transaction_id, secret } = req.query;
-  if (!ADS_SSV_SECRET || secret !== ADS_SSV_SECRET) return res.status(401).json({ error: 'No autorizado' });
-  if (!isValidId(user_id) || !transaction_id) return res.status(400).json({ error: 'Datos inválidos' });
-
+app.post('/api/battles/:id/report', async (req, res) => {
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
-    const existing = await client.query('SELECT 1 FROM ad_rewards WHERE transaction_id=$1', [transaction_id]);
-    if (existing.rowCount) { await client.query('COMMIT'); return res.json({ message: 'Ya procesada' }); }
-
-    const todayTotal = await client.query(
-      `SELECT COALESCE(SUM(points_credited),0) AS total FROM ad_rewards
-       WHERE user_id=$1 AND created_at >= date_trunc('day', NOW())`,
-      [user_id]
-    );
-    if (Number(todayTotal.rows[0].total) >= DAILY_AD_POINTS_CAP) {
-      await client.query('COMMIT');
-      return res.json({ message: 'Límite diario de anuncios alcanzado', credited: 0 });
-    }
-    const toCredit = Math.min(POINTS_PER_AD, DAILY_AD_POINTS_CAP - Number(todayTotal.rows[0].total));
-
-    await client.query(
-      'INSERT INTO ad_rewards(user_id, transaction_id, points_credited) VALUES($1,$2,$3)',
-      [user_id, transaction_id, toCredit]
-    );
-    await client.query('UPDATE users SET giftable_points = giftable_points + $1 WHERE id=$2', [toCredit, user_id]);
+    await client.query(`INSERT INTO reports(battle_id,reporter_id,reason) VALUES($1,$2,$3)`,
+      [req.params.id,clean(req.body.reporter_id),clean(req.body.reason)]);
+    const c = await client.query(`
+      UPDATE battles SET report_count=report_count+1,
+      hidden=(report_count+1)>=3 WHERE id=$1 RETURNING hidden`, [req.params.id]);
     await client.query('COMMIT');
-    res.json({ message: 'Puntos acreditados', credited: toCredit });
-  } catch (e) { await client.query('ROLLBACK'); res.status(500).json({ error: e.message }); }
-  finally { client.release(); }
+    res.json({ message:'Reporte recibido.', hidden:c.rows[0].hidden });
+  } catch (e) {
+    await client.query('ROLLBACK');
+    res.status(400).json({ error:e.code === '23505' ? 'Ya reportaste esta batalla.' : e.message });
+  } finally { client.release(); }
 });
 
-app.use((req, res) => res.status(404).json({ error: 'No encontrado' }));
+app.delete('/api/users/:id', async (req, res) => {
+  try {
+    await pool.query(`UPDATE users SET deleted_at=NOW() WHERE id=$1`, [req.params.id]);
+    res.json({ message:'Cuenta eliminada.' });
+  } catch (e) { res.status(500).json({ error:e.message }); }
+});
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Servidor AURA ejecutándose en puerto ${PORT}`));
+app.listen(PORT, () => console.log(`AURA STAR API v3.2 escuchando en ${PORT}`));
