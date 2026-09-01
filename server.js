@@ -2,7 +2,6 @@ const express = require('express');
 const cors = require('cors');
 const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
-const jwt = require('jsonwebtoken');
 const { Pool } = require('pg');
 
 const app = express();
@@ -21,25 +20,38 @@ const CONFIG = {
   MIN_DIFF: 3,
   ARBITER_CLOSE_VOTES: 30,
   MAX_ACTIVE_PER_USER: 5,
-  SUPABASE_JWT_SECRET: process.env.SUPABASE_JWT_SECRET
+  SUPABASE_URL: process.env.SUPABASE_URL || 'https://saqhaofycdjlwdauzhtv.supabase.co',
+  SUPABASE_ANON_KEY: process.env.SUPABASE_ANON_KEY
 };
 
 const writeLimiter = rateLimit({ windowMs: 60 * 1000, max: 20, standardHeaders: true, legacyHeaders: false });
 const voteLimiter = rateLimit({ windowMs: 60 * 1000, max: 30, standardHeaders: true, legacyHeaders: false });
 
-// Middleware para extracción y verificación de JWT emitido por Supabase Auth
-function requireAuth(req, res, next) {
+// Middleware: valida el access token directamente contra Supabase Auth.
+// Esto evita depender del JWT secret legado y funciona también con claves de firma asimétricas.
+async function requireAuth(req, res, next) {
   const authHeader = req.headers.authorization;
   if (!authHeader || !authHeader.startsWith('Bearer ')) {
-    return res.status(401).json({ error: 'Token de sesión requerido' });
+    return res.status(401).json({ error: 'Token de sesión requerido', code: 'NO_TOKEN' });
   }
-  const token = authHeader.split(' ')[1];
+  const token = authHeader.slice(7).trim();
   try {
-    const decoded = jwt.verify(token, CONFIG.SUPABASE_JWT_SECRET);
-    req.userId = decoded.sub; // ID seguro garantizado por la firma del servidor Auth
+    const r = await fetch(`${CONFIG.SUPABASE_URL}/auth/v1/user`, {
+      headers: {
+        Authorization: `Bearer ${token}`,
+        apikey: CONFIG.SUPABASE_ANON_KEY || ''
+      }
+    });
+    const user = await r.json().catch(() => null);
+    if (!r.ok || !user?.id) {
+      return res.status(401).json({ error: 'Sesión expirada o token inválido', code: 'INVALID_TOKEN' });
+    }
+    req.userId = user.id;
+    req.authUser = user;
     next();
   } catch (err) {
-    return res.status(401).json({ error: 'Sesión expirada o token inválido' });
+    console.error('Supabase token validation:', err.message);
+    return res.status(503).json({ error: 'No se pudo validar la sesión con Supabase.', code: 'AUTH_SERVICE_UNAVAILABLE' });
   }
 }
 
