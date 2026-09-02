@@ -137,7 +137,6 @@ app.post('/api/users', auth, rateLimit({windowMs:60000,max:20}), async (req,res)
   } catch(e){ console.error(e); res.status(500).json({error:'No se pudo guardar el usuario'}); }
 });
 
-// Endpoint oficial del Test de Aura
 app.post('/api/users/aura-test', auth, rateLimit({ windowMs: 60000, max: 5 }), async (req, res) => {
   const client = await pool.connect();
   try {
@@ -202,6 +201,7 @@ app.delete('/api/users/:id', auth, async (req,res) => {
   }catch(e){await client.query('ROLLBACK');res.status(400).json({error:e.message});}finally{client.release();}
 });
 
+// Listado global público: Todos pueden ver las batallas
 app.get('/api/battles', async (req,res) => {
   const limit=Math.min(Math.max(parseInt(req.query.limit,10)||30,1),50);
   try{
@@ -242,6 +242,12 @@ app.post('/api/battles', auth, rateLimit({windowMs:60000,max:20}), async (req,re
       const neutral=Boolean(req.body?.local_neutral);
       if(!isValidId(a)||!isValidId(b)||a===b)throw Error('Los dos competidores deben ser válidos y distintos.');
       const pa=await getActiveUser(client,a);const pb=await getActiveUser(client,b);if(!pa||!pb)throw Error('Uno de los competidores no existe o no está disponible.');
+      
+      // BLOQUEO DE COMPETENCIA ENTRE DISTINTAS EDADES EN LOCAL
+      if(pa.age_bracket && pb.age_bracket && pa.age_bracket !== pb.age_bracket){
+        throw Error('No se pueden enfrentar competidores de distintas franjas etarias.');
+      }
+
       const cost=LOCAL_COST;
       if(user.giftable_points<cost)throw Error(`Necesitás ${cost} puntos regalables para crear una batalla local.`);
       await client.query('UPDATE users SET giftable_points=giftable_points-$1 WHERE id=$2',[cost,req.userId]);
@@ -255,6 +261,7 @@ app.post('/api/battles', auth, rateLimit({windowMs:60000,max:20}), async (req,re
   }catch(e){await client.query('ROLLBACK');res.status(400).json({error:e.message});}finally{client.release();}
 });
 
+// BLOQUEO DE COMPETENCIA: Unirse a una batalla solo se permite si coinciden en age_bracket
 app.post('/api/battles/:id/join', auth, rateLimit({windowMs:60000,max:20}), async (req,res) => {
   const url=req.body?.media_url_opponent||req.body?.media_url;if(!validateMediaUrl(url))return res.status(400).json({error:'La participación del oponente es obligatoria'});
   const client=await pool.connect();
@@ -264,12 +271,18 @@ app.post('/api/battles/:id/join', auth, rateLimit({windowMs:60000,max:20}), asyn
     const q=await client.query('SELECT * FROM battles WHERE id=$1 FOR UPDATE',[req.params.id]);const b=q.rows[0];if(!b||b.status!=='active')throw Error('La batalla no está activa');
     if(b.mode==='local')throw Error('Las batallas locales no se aceptan por este enlace');if(b.creator_id===req.userId)throw Error('No podés unirte a tu propia batalla');if(b.opponent_id)throw Error('La batalla ya tiene oponente');
     const creator=await getActiveUser(client,b.creator_id);if(!creator)throw Error('Creador no disponible');
-    if(creator.age_bracket&&user.age_bracket&&creator.age_bracket!==user.age_bracket)throw Error('Esta batalla es de otra franja etaria.');
+    
+    // VALIDACIÓN ESTRICTA: Solo pueden competir si son de la misma franja etaria
+    if(creator.age_bracket && user.age_bracket && creator.age_bracket !== user.age_bracket){
+      throw Error('No podés competir contra usuarios de otra franja etaria.');
+    }
+    
     const r=await client.query(`UPDATE battles SET opponent_id=$1,media_url_opponent=$2 WHERE id=$3 AND opponent_id IS NULL RETURNING *`,[req.userId,url,req.params.id]);if(!r.rowCount)throw Error('Otro usuario aceptó la batalla primero');
     await client.query('COMMIT');res.json(r.rows[0]);
   }catch(e){await client.query('ROLLBACK');res.status(400).json({error:e.message});}finally{client.release();}
 });
 
+// VOTACIÓN ABIERTA: Cualquier usuario activo puede votar independientemente de su edad
 app.post('/api/battles/:id/vote', auth, rateLimit({windowMs:60000,max:30}), async (req,res) => {
   const target=req.body?.voted_user_id;if(!isValidId(target))return res.status(400).json({error:'Participante inválido'});
   const client=await pool.connect();
