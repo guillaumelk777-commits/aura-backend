@@ -4,7 +4,6 @@ const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
 const crypto = require('crypto');
 const { Pool } = require('pg');
-const { jwtVerify, createRemoteJWKSet } = require('jose');
 
 const app = express();
 app.set('trust proxy', 1);
@@ -25,8 +24,7 @@ const pool = new Pool({ connectionString: process.env.DATABASE_URL });
 pool.on('error', err => console.error('Postgres pool error', err));
 
 const SUPABASE_URL = String(process.env.SUPABASE_URL || '').replace(/\/$/, '');
-const SUPABASE_JWT_SECRET = process.env.SUPABASE_JWT_SECRET || '';
-const jwks = SUPABASE_URL ? createRemoteJWKSet(new URL(`${SUPABASE_URL}/auth/v1/.well-known/jwks.json`)) : null;
+const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY || '';
 
 const CATEGORIES = ['gaming','freestyle','dance','singing','music','sports','art','photography','cosplay','other'];
 const MODES = ['video','audio','photo','local'];
@@ -36,26 +34,20 @@ const DAILY_GIFT_LIMIT_PER_RECIPIENT = 50;
 const POINTS_PER_AD = 5;
 const DAILY_AD_POINTS_CAP = 60;
 const LOCAL_COST = 20;
-const LOCAL_HOURS = 2;
 const ARBITER_CLOSE_VOTES = 30;
 const MIN_VOTES = 10;
 const MIN_DIFF = 3;
 
-// Configurable. Se cuentan usuarios únicos que completan el reclamo del enlace.
-// Si la regla comercial definida previamente cambia, solo se modifica esta variable en Render.
-const SHARE_REWARD_MILESTONES = parseMilestones(process.env.SHARE_REWARD_MILESTONES || '5:5,10:10,25:25');
+const SHARE_REWARD_MILESTONES = parseMilestones(process.env.SHARE_REWARD_MILESTONES || '5:10,10:20,25:70');
 const SHARE_BASE_URL = (process.env.SHARE_BASE_URL || process.env.FRONTEND_ORIGIN || '').replace(/\/$/, '');
-const SHARE_TOKEN_SECRET = process.env.SHARE_TOKEN_SECRET || '';
+const SHARE_TOKEN_SECRET = process.env.SHARE_TOKEN_SECRET || 'aura_star_secret_key_default';
 const REVENUECAT_WEBHOOK_SECRET = process.env.REVENUECAT_WEBHOOK_SECRET || '';
 
 const PRODUCTS = {
   starter: { points: 50 },
   plus: { points: 120 },
   pro: { points: 300 },
-  mega: { points: 700 },
-  aura_points_small: { points: 100 },
-  aura_points_medium: { points: 300 },
-  aura_points_large: { points: 700 }
+  mega: { points: 700 }
 };
 
 function parseMilestones(raw) {
@@ -69,29 +61,24 @@ function parseMilestones(raw) {
 function isValidId(v) { return typeof v === 'string' && v.trim().length > 0 && v.length <= 200; }
 function isUuid(v) { return typeof v === 'string' && /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(v); }
 function sha256(v) { return crypto.createHash('sha256').update(v).digest('hex'); }
-function newToken() { return crypto.randomBytes(32).toString('base64url'); }
-function errorMessage(e) { return e && e.message ? e.message : 'Error interno'; }
 
-async function verifyToken(token) {
-  if (!token) throw new Error('Token ausente');
-  if (SUPABASE_JWT_SECRET) {
-    const { payload } = await jwtVerify(token, new TextEncoder().encode(SUPABASE_JWT_SECRET), { algorithms: ['HS256'] });
-    if (!payload.sub) throw new Error('Token inválido');
-    return payload;
-  }
-  if (!jwks) throw new Error('SUPABASE_URL no configurada');
-  const { payload } = await jwtVerify(token, jwks, { issuer: `${SUPABASE_URL}/auth/v1`, audience: 'authenticated' });
-  if (!payload.sub) throw new Error('Token inválido');
-  return payload;
-}
-
+// Validar token consultando directamente a Supabase Auth API
 async function auth(req, res, next) {
   const h = req.headers.authorization || '';
   if (!h.startsWith('Bearer ')) return res.status(401).json({ error: 'Autenticación requerida' });
+  const token = h.slice(7);
   try {
-    const payload = await verifyToken(h.slice(7));
-    req.userId = String(payload.sub);
-    req.auth = payload;
+    const r = await fetch(`${SUPABASE_URL}/auth/v1/user`, {
+      headers: {
+        'Authorization': `Bearer ${token}`,
+        'apikey': SUPABASE_ANON_KEY
+      }
+    });
+    if (!r.ok) throw new Error('Sesión inválida');
+    const user = await r.json();
+    if (!user || !user.id) throw new Error('Usuario no válido');
+    req.userId = user.id;
+    req.authUser = user;
     next();
   } catch (e) {
     return res.status(401).json({ error: 'Sesión inválida o expirada' });
@@ -106,6 +93,7 @@ async function getActiveUser(clientOrPool, userId, forUpdate = false) {
   );
   return q.rows[0] || null;
 }
+
 async function activeBattleCount(client, userId) {
   const q = await client.query(
     `SELECT COUNT(*)::int AS count FROM battles WHERE status='active'
@@ -132,7 +120,7 @@ async function settleBattle(client, b, vc, vo, forcedWinner = null) {
   return winnerId;
 }
 
-app.get('/', (req,res) => res.json({ app:'AURA STAR', version:'2.2', status:'ok', share_milestones: SHARE_REWARD_MILESTONES }));
+app.get('/', (req,res) => res.json({ app:'AURA STAR', version:'2.3', status:'ok' }));
 
 app.post('/api/users', auth, rateLimit({windowMs:60000,max:20}), async (req,res) => {
   const username = typeof req.body?.username === 'string' ? req.body.username.trim().slice(0,40) : null;
@@ -143,106 +131,39 @@ app.post('/api/users', auth, rateLimit({windowMs:60000,max:20}), async (req,res)
     const q = await pool.query(
       `INSERT INTO users(id,username,age_bracket) VALUES($1,$2,$3)
        ON CONFLICT(id) DO UPDATE SET username=COALESCE(NULLIF($2,''),users.username),age_bracket=COALESCE($3,users.age_bracket)
-       RETURNING id,username,aura_points,giftable_points,age_bracket,is_banned,created_at`,
+       RETURNING id,username,aura_points,giftable_points,age_bracket,is_banned,created_at,aura_test_completed`,
       [req.userId,username,age || null]
     );
     res.json(q.rows[0]);
   } catch(e){ console.error(e); res.status(500).json({error:'No se pudo guardar el usuario'}); }
 });
 
-
-// ============================================================
-// AURA INITIAL TEST — one-time server-side reward
-// ============================================================
-const AURA_TEST_MIN = 20;
-const AURA_TEST_MAX = 100;
-
-function computeAuraTestRange(answers) {
-  // Five questions, four options each. We deliberately keep
-  // the final score random inside a server-calculated range.
-  const weights = [0, 1, 2, 3];
-  const normalized = answers.map(v => weights[v] ?? 0);
-  const total = normalized.reduce((a, b) => a + b, 0);
-  const maxTotal = 15;
-
-  // Range is derived from answers but the final value is random.
-  const center = 20 + Math.round((total / maxTotal) * 80);
-  const spread = 10;
-  return {
-    min: Math.max(AURA_TEST_MIN, center - spread),
-    max: Math.min(AURA_TEST_MAX, center + spread)
-  };
-}
-
-app.post('/api/users/aura-test', auth, rateLimit({windowMs:60000,max:5}), async (req,res) => {
-  const answers = Array.isArray(req.body?.answers) ? req.body.answers : null;
-  const cameraUsed = Boolean(req.body?.camera_used);
-
-  if (!answers || answers.length !== 5 || answers.some(v => !Number.isInteger(v) || v < 0 || v > 3)) {
-    return res.status(400).json({error:'Respuestas del test inválidas'});
-  }
-
+app.post('/api/users/aura-test', auth, rateLimit({ windowMs: 60000, max: 5 }), async (req, res) => {
   const client = await pool.connect();
-
   try {
     await client.query('BEGIN');
+    const u = await getActiveUser(client, req.userId, true);
+    if (!u) throw Error('Usuario no encontrado.');
+    if (u.aura_test_completed) throw Error('Ya realizaste tu test de Aura inicial.');
 
-    // Lock the authenticated user's row so two simultaneous requests
-    // cannot both receive the one-time reward.
-    const userQ = await client.query(
-      `SELECT id, aura_points, giftable_points, aura_test_completed, is_banned, deleted_at
-       FROM users WHERE id=$1 AND deleted_at IS NULL FOR UPDATE`,
-      [req.userId]
-    );
+    const randomAura = Math.floor(Math.random() * (100 - 20 + 1)) + 20;
 
-    const user = userQ.rows[0];
-    if (!user) throw Error('Usuario no encontrado');
-    if (user.is_banned) throw Error('Cuenta suspendida');
-
-    if (user.aura_test_completed === true) {
-      await client.query('ROLLBACK');
-      return res.status(409).json({
-        error:'El Test de Aura Inicial ya fue realizado.',
-        already_completed:true,
-        total_aura:Number(user.aura_points || 0)
-      });
-    }
-
-    const range = computeAuraTestRange(answers);
-    const creditedAura = range.min + crypto.randomInt(range.max - range.min + 1);
-
-    // Optional audit table. If it exists, record the test without
-    // storing camera frames or biometric information.
     await client.query(
-      `UPDATE users
-       SET aura_points=aura_points+$1,
-           aura_test_completed=true
-       WHERE id=$2`,
-      [creditedAura, req.userId]
+      `UPDATE users SET aura_points = aura_points + $1, aura_test_completed = true WHERE id = $2`,
+      [randomAura, req.userId]
     );
 
     await client.query(
       `INSERT INTO aura_tests(user_id,answers,camera_used,credited_aura)
-       VALUES($1,$2,$3,$4)
-       ON CONFLICT(user_id) DO NOTHING`,
-      [req.userId, JSON.stringify(answers), cameraUsed, creditedAura]
-    );
-
-    const updated = await client.query(
-      'SELECT aura_points FROM users WHERE id=$1',
-      [req.userId]
+       VALUES($1,$2,$3,$4) ON CONFLICT(user_id) DO NOTHING`,
+      [req.userId, JSON.stringify(req.body?.answers || []), Boolean(req.body?.camera_used), randomAura]
     );
 
     await client.query('COMMIT');
-
-    return res.json({
-      credited_aura: creditedAura,
-      total_aura: Number(updated.rows[0].aura_points)
-    });
-  } catch(e) {
+    res.json({ credited_aura: randomAura, total_aura: u.aura_points + randomAura });
+  } catch (e) {
     await client.query('ROLLBACK');
-    console.error('aura-test', e);
-    return res.status(400).json({error:e.message || 'No se pudo completar el Test de Aura'});
+    res.status(400).json({ error: e.message });
   } finally {
     client.release();
   }
@@ -320,7 +241,6 @@ app.post('/api/battles', auth, rateLimit({windowMs:60000,max:20}), async (req,re
       const a=String(req.body?.local_participant_a||'').trim(),b=String(req.body?.local_participant_b||'').trim();
       const neutral=Boolean(req.body?.local_neutral);
       if(!isValidId(a)||!isValidId(b)||a===b)throw Error('Los dos competidores deben ser válidos y distintos.');
-      if(neutral && req.userId!==req.userId)throw Error('Árbitro inválido');
       const pa=await getActiveUser(client,a);const pb=await getActiveUser(client,b);if(!pa||!pb)throw Error('Uno de los competidores no existe o no está disponible.');
       const cost=LOCAL_COST;
       if(user.giftable_points<cost)throw Error(`Necesitás ${cost} puntos regalables para crear una batalla local.`);
@@ -402,10 +322,7 @@ app.get('/api/battles/local/search', auth, async (req,res) => {
 });
 
 app.get('/api/share', auth, async (req,res) => {
-  if(!SHARE_TOKEN_SECRET) return res.status(500).json({error:'SHARE_TOKEN_SECRET no configurado'});
   try{
-    // Token estable por usuario: el enlace no cambia cada vez que se abre el perfil.
-    // El cliente nunca puede elegir el referrer; el servidor lo deriva del token.
     const token=crypto.createHmac('sha256',SHARE_TOKEN_SECRET).update(`aura-share-v2:${req.userId}`).digest('base64url');
     const tokenHash=sha256(token);
     await pool.query('INSERT INTO share_invites(user_id,token_hash) VALUES($1,$2) ON CONFLICT(user_id) DO UPDATE SET token_hash=EXCLUDED.token_hash',[req.userId,tokenHash]);
@@ -453,14 +370,11 @@ app.post('/api/webhooks/revenuecat', async (req,res) => {
   const store=event.store==='PLAY_STORE'?'play_store':'app_store',client=await pool.connect();try{await client.query('BEGIN');if(!(await getActiveUser(client,userId,true)))throw Error('Usuario no encontrado');const ins=await client.query(`INSERT INTO purchases(user_id,product_id,store,transaction_id,points_credited) VALUES($1,$2,$3,$4,$5) ON CONFLICT(transaction_id) DO NOTHING RETURNING id`,[userId,productId,store,transactionId,product.points]);if(ins.rowCount)await client.query('UPDATE users SET giftable_points=giftable_points+$1 WHERE id=$2',[product.points,userId]);await client.query('COMMIT');res.json({message:ins.rowCount?'Puntos acreditados':'Ya procesada',points_credited:ins.rowCount?product.points:0});}catch(e){await client.query('ROLLBACK');res.status(500).json({error:'No se pudo procesar la compra'});}finally{client.release();}
 });
 
-// Este endpoint queda reservado para un adaptador SSV que valide criptográficamente el callback de AdMob.
-// No acepta user_id desde el cliente y no debe exponerse como mecanismo de recompensa.
 app.post('/api/ads/reward', auth, async (req,res) => {
   const transactionId=typeof req.body?.transaction_id==='string'?req.body.transaction_id.trim():'';if(!transactionId||transactionId.length>200)return res.status(400).json({error:'transaction_id inválido'});
   const client=await pool.connect();try{await client.query('BEGIN');const u=await getActiveUser(client,req.userId,true);if(!u||u.is_banned)throw Error('Cuenta no disponible');const exists=await client.query('SELECT 1 FROM ad_rewards WHERE transaction_id=$1',[transactionId]);if(exists.rowCount){await client.query('COMMIT');return res.json({message:'Ya procesada',credited:0});}const today=await client.query(`SELECT COALESCE(SUM(points_credited),0)::int total FROM ad_rewards WHERE user_id=$1 AND created_at>=date_trunc('day',NOW())`,[req.userId]);const current=Number(today.rows[0].total);if(current>=DAILY_AD_POINTS_CAP){await client.query('COMMIT');return res.json({message:'Límite diario alcanzado',credited:0});}const credit=Math.min(POINTS_PER_AD,DAILY_AD_POINTS_CAP-current);await client.query('INSERT INTO ad_rewards(user_id,transaction_id,points_credited) VALUES($1,$2,$3)',[req.userId,transactionId,credit]);await client.query('UPDATE users SET giftable_points=giftable_points+$1 WHERE id=$2',[credit,req.userId]);await client.query('COMMIT');res.json({message:'Puntos acreditados',credited:credit});}catch(e){await client.query('ROLLBACK');res.status(400).json({error:e.message});}finally{client.release();}
 });
 
-// Cierre automático de batallas locales vencidas: si cumple mínimos, gana quien tenga mayor voto; si no, cancela sin Aura.
 async function expireLocalBattles(){
   const client=await pool.connect();try{await client.query('BEGIN');const q=await client.query(`SELECT * FROM battles WHERE mode='local' AND status='active' AND local_closes_at IS NOT NULL AND local_closes_at<=NOW() FOR UPDATE`);for(const b of q.rows){const winner=winnerFor(b,Number(b.votes_creator),Number(b.votes_opponent));if(winner){const loser=winner===b.local_participant_a?b.local_participant_b:b.local_participant_a;await client.query('UPDATE users SET aura_points=aura_points+20 WHERE id=$1',[winner]);await client.query('UPDATE users SET aura_points=GREATEST(0,aura_points-5) WHERE id=$1',[loser]);await client.query(`UPDATE battles SET status='completed',winner_id=$1,closed_at=NOW() WHERE id=$2`,[winner,b.id]);}else await client.query(`UPDATE battles SET status='cancelled',closed_at=NOW() WHERE id=$1`,[b.id]);}await client.query('COMMIT');}catch(e){await client.query('ROLLBACK');console.error('expireLocalBattles',e);}finally{client.release();}}
 setInterval(expireLocalBattles,60000);
@@ -468,4 +382,4 @@ setInterval(expireLocalBattles,60000);
 app.use((err,req,res,next)=>{console.error(err);res.status(500).json({error:'Error de servidor'});});
 app.use((req,res)=>res.status(404).json({error:'No encontrado'}));
 
-const PORT=process.env.PORT||3000;app.listen(PORT,()=>console.log(`AURA STAR API v2.2 en puerto ${PORT}`));
+const PORT=process.env.PORT||3000;app.listen(PORT,()=>console.log(`AURA STAR API v2.3 en puerto ${PORT}`));
