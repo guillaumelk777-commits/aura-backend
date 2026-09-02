@@ -62,7 +62,6 @@ function isValidId(v) { return typeof v === 'string' && v.trim().length > 0 && v
 function isUuid(v) { return typeof v === 'string' && /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(v); }
 function sha256(v) { return crypto.createHash('sha256').update(v).digest('hex'); }
 
-// Validar token consultando directamente a Supabase Auth API
 async function auth(req, res, next) {
   const h = req.headers.authorization || '';
   if (!h.startsWith('Bearer ')) return res.status(401).json({ error: 'Autenticación requerida' });
@@ -138,6 +137,7 @@ app.post('/api/users', auth, rateLimit({windowMs:60000,max:20}), async (req,res)
   } catch(e){ console.error(e); res.status(500).json({error:'No se pudo guardar el usuario'}); }
 });
 
+// Endpoint oficial del Test de Aura
 app.post('/api/users/aura-test', auth, rateLimit({ windowMs: 60000, max: 5 }), async (req, res) => {
   const client = await pool.connect();
   try {
