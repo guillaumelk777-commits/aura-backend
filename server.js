@@ -30,7 +30,6 @@ const writeLimiter = rateLimit({ windowMs: 60 * 1000, max: 20, standardHeaders: 
 const voteLimiter = rateLimit({ windowMs: 60 * 1000, max: 30, standardHeaders: true, legacyHeaders: false });
 
 // Middleware: valida el access token directamente contra Supabase Auth.
-// Esto evita depender del JWT secret legado y funciona también con claves de firma asimétricas.
 async function requireAuth(req, res, next) {
   const authHeader = req.headers.authorization;
   if (!authHeader || !authHeader.startsWith('Bearer ')) {
@@ -63,7 +62,6 @@ const clean = s => String(s ?? '').trim();
 const participantIds = b => b.mode === 'local' ? [b.local_participant_a, b.local_participant_b] : [b.creator_id, b.opponent_id];
 const canResolve = (a, o) => a + o >= CONFIG.MIN_VOTES && Math.abs(a - o) >= CONFIG.MIN_DIFF;
 
-// Traduce errores comunes de Postgres a mensajes entendibles para el usuario.
 function friendlyDbError(e) {
   if (e.code === '23505') return 'Ya existe un registro con esos datos (conflicto de unicidad).';
   if (e.code === '23514') return 'Los datos no cumplen las reglas de la batalla (revisá título, participantes o costo).';
@@ -71,13 +69,6 @@ function friendlyDbError(e) {
   return e.message;
 }
 
-// IMPORTANTE: esta función corre dentro de su propia transacción (BEGIN/COMMIT)
-// para que el FOR UPDATE realmente bloquee las filas mientras se resuelven.
-// Antes se ejecutaba con pool.query() suelto, que Postgres trata como una
-// transacción implícita de una sola sentencia: el bloqueo se liberaba apenas
-// terminaba el SELECT, así que dos llamadas concurrentes (el setInterval de
-// 60s y, por ejemplo, un GET /api/battles simultáneo) podían tomar la misma
-// batalla vencida y acreditar el premio de Aura dos veces.
 async function expireLocalBattles() {
   const client = await pool.connect();
   try {
@@ -126,13 +117,13 @@ app.post('/api/users', writeLimiter, requireAuth, async (req, res) => {
 
     const r = await pool.query(
       `INSERT INTO users(id, username, age_bracket) VALUES($1, $2, $3)
-       ON CONFLICT(id) DO UPDATE SET username = EXCLUDED.username
+       ON CONFLICT(id) DO UPDATE SET username = EXCLUDED.username, age_bracket = EXCLUDED.age_bracket, deleted_at = NULL
        RETURNING *`,
       [id, username, ageBracket]
     );
     res.json(r.rows[0]);
   } catch (e) {
-    res.status(400).json({ error: e.code === '23505' ? 'Ese nombre de usuario ya está tomado.' : e.message });
+    res.status(400).json({ error: e.code === '23505' ? 'Ese nombre de usuario ya está en uso por otra cuenta activa. Probá con otro, o si creés que es un error verificá que estés iniciando sesión con la misma cuenta de Google/Apple que usaste antes.' : e.message });
   }
 });
 
@@ -215,7 +206,6 @@ app.get('/api/battles/:id', async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// Crear Batalla (Formatos Multimedia o Local)
 app.post('/api/battles', writeLimiter, requireAuth, async (req, res) => {
   const creatorId = req.userId;
   const { mode = 'video', category, title, theme, media_url_creator, local_participant_a, local_participant_b, local_neutral = false } = req.body;
@@ -282,7 +272,6 @@ app.post('/api/battles', writeLimiter, requireAuth, async (req, res) => {
   } finally { client.release(); }
 });
 
-// Unirse a Batalla
 app.post('/api/battles/:id/join', writeLimiter, requireAuth, async (req, res) => {
   const opponentId = req.userId;
   const { media_url } = req.body;
@@ -314,7 +303,6 @@ app.post('/api/battles/:id/join', writeLimiter, requireAuth, async (req, res) =>
   } finally { client.release(); }
 });
 
-// Registrar Voto
 app.post('/api/battles/:id/vote', voteLimiter, requireAuth, async (req, res) => {
   const voterId = req.userId;
   const { voted_user_id } = req.body;
@@ -356,7 +344,6 @@ app.post('/api/battles/:id/vote', voteLimiter, requireAuth, async (req, res) => 
   } finally { client.release(); }
 });
 
-// Cierre de Batalla por Árbitro Neutral
 app.post('/api/battles/:id/arbiter-close', writeLimiter, requireAuth, async (req, res) => {
   const arbiterId = req.userId;
   const client = await pool.connect();
@@ -388,7 +375,6 @@ app.post('/api/battles/:id/arbiter-close', writeLimiter, requireAuth, async (req
   } finally { client.release(); }
 });
 
-// Reportes
 app.post('/api/battles/:id/report', writeLimiter, requireAuth, async (req, res) => {
   const reporterId = req.userId;
   const client = await pool.connect();
@@ -405,7 +391,6 @@ app.post('/api/battles/:id/report', writeLimiter, requireAuth, async (req, res) 
   } finally { client.release(); }
 });
 
-// Plataforma de pagos — endpoint preparado, sin cobro real hasta configurar el proveedor.
 app.post('/api/payments/create-checkout', writeLimiter, requireAuth, async (req, res) => {
   const { package_id } = req.body || {};
   const packages = { starter: 50, plus: 120, pro: 300, mega: 700 };
@@ -416,7 +401,6 @@ app.post('/api/payments/create-checkout', writeLimiter, requireAuth, async (req,
   return res.status(501).json({ error: 'Proveedor de pagos pendiente de integración segura.', code: 'PAYMENTS_PENDING' });
 });
 
-// Eliminar cuenta propia
 app.delete('/api/users/:id', requireAuth, async (req, res) => {
   if (req.params.id !== req.userId) return res.status(403).json({ error: 'Operación no autorizada.' });
   try {
