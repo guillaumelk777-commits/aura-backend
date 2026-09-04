@@ -104,7 +104,7 @@ async function activeBattleCount(client, userId) {
 
 function validateMediaUrl(v) { return typeof v === 'string' && /^https:\/\//i.test(v) && v.length <= 2048; }
 
-app.get('/', (req,res) => res.json({ app:'AURA STAR', version:'5.1', status:'ok' }));
+app.get('/', (req,res) => res.json({ app:'AURA STAR', version:'5.2', status:'ok' }));
 
 // CREAR/ACTUALIZAR USUARIO
 app.post('/api/users', auth, rateLimit({windowMs:60000,max:20}), async (req,res) => {
@@ -188,6 +188,27 @@ app.get('/api/battles', async (req,res) => {
     res.json(q.rows);
   } catch(e) {
     res.status(500).json({ error: 'No se pudieron cargar las batallas' });
+  }
+});
+
+// OBTENER DETALLE DE BATALLA POR ID
+app.get('/api/battles/:id', async (req, res) => {
+  if(!isUuid(req.params.id)) return res.status(400).json({error:'ID de batalla inválido'});
+  try {
+    const q = await pool.query(
+      `SELECT b.*, ua.username creator_name, ub.username opponent_name,
+              ula.username local_a_name, ulb.username local_b_name
+       FROM battles b 
+       LEFT JOIN users ua ON ua.id=b.creator_id 
+       LEFT JOIN users ub ON ub.id=b.opponent_id
+       LEFT JOIN users ula ON ula.id=b.local_participant_a 
+       LEFT JOIN users ulb ON ulb.id=b.local_participant_b 
+       WHERE b.id=$1`, [req.params.id]
+    );
+    if(!q.rows[0]) return res.status(404).json({error:'Batalla no encontrada'});
+    res.json(q.rows[0]);
+  } catch(e) {
+    res.status(500).json({error:'No se pudo cargar la batalla'});
   }
 });
 
@@ -292,7 +313,10 @@ app.post('/api/users/aura-test', auth, rateLimit({ windowMs: 60000, max: 5 }), a
   }
 });
 
+// ----------------------------------------------------
 // RUTAS DE MODERACIÓN / ADMIN
+// ----------------------------------------------------
+
 async function requireAdmin(req,res,next){
   try{
     const q = await pool.query(`SELECT is_admin,moderation_role FROM users WHERE id=$1 AND deleted_at IS NULL`,[req.userId]);
@@ -347,8 +371,37 @@ app.post('/api/admin/grant-points', auth, requireAdmin, async (req,res) => {
   } finally { client.release(); }
 });
 
+// ELIMINAR BATALLA (ADMIN)
+app.delete('/api/admin/battles/:id', auth, requireAdmin, async (req, res) => {
+  const battleId = req.params.id;
+  if (!isUuid(battleId)) return res.status(400).json({ error: 'ID de batalla inválido.' });
+  
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    await client.query('DELETE FROM votes WHERE battle_id = $1', [battleId]);
+    await client.query('DELETE FROM reports WHERE battle_id = $1', [battleId]);
+    
+    const r = await client.query('DELETE FROM battles WHERE id = $1 RETURNING id, title', [battleId]);
+    if (!r.rowCount) throw new Error('La batalla no existe o ya fue eliminada.');
+    
+    await client.query(
+      `INSERT INTO admin_audit_logs(admin_id, action_type, reason) VALUES($1, 'DELETE_BATTLE', $2)`,
+      [req.userId, `Borrado de batalla ID: ${battleId}`]
+    );
+    
+    await client.query('COMMIT');
+    res.json({ message: '🗑️ Batalla eliminada correctamente.' });
+  } catch (e) {
+    await client.query('ROLLBACK');
+    res.status(400).json({ error: e.message });
+  } finally {
+    client.release();
+  }
+});
+
 app.use((err,req,res,next) => { console.error(err); res.status(500).json({error:'Error de servidor'}); });
 app.use((req,res) => res.status(404).json({error:'Ruta no encontrada'}));
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`AURA STAR API v5.1 en puerto ${PORT}`));
+app.listen(PORT, () => console.log(`AURA STAR API v5.2 en puerto ${PORT}`));
