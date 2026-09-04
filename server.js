@@ -35,26 +35,9 @@ const REPORT_HIDE_THRESHOLD = 3;
 const DAILY_GIFT_LIMIT_PER_RECIPIENT = 50;
 const LOCAL_COST = 0;
 const TOURNAMENT_COST = Number(process.env.TOURNAMENT_COST || 0);
-const TOURNAMENT_TIEBREAK_MINUTES = Number(process.env.TOURNAMENT_TIEBREAK_MINUTES || 30);
-const ARBITER_CLOSE_VOTES = 30;
-const MIN_VOTES = 10;
-const MIN_DIFF = 3;
 
-const SHARE_REWARD_MILESTONES = parseMilestones(process.env.SHARE_REWARD_MILESTONES || '5:5,10:10,25:25');
-const SHARE_BASE_URL = (process.env.SHARE_BASE_URL || process.env.FRONTEND_ORIGIN || '').replace(/\/$/, '');
-const SHARE_TOKEN_SECRET = process.env.SHARE_TOKEN_SECRET || '';
-
-function parseMilestones(raw) {
-  const out = raw.split(',').map(x => x.trim()).map(x => {
-    const [users, points] = x.split(':').map(Number);
-    return Number.isInteger(users) && users > 0 && Number.isInteger(points) && points > 0 ? { users, points } : null;
-  }).filter(Boolean).sort((a,b) => a.users - b.users);
-  const seen = new Set();
-  return out.filter(x => !seen.has(x.users) && seen.add(x.users));
-}
 function isValidId(v) { return typeof v === 'string' && v.trim().length > 0 && v.length <= 200; }
 function isUuid(v) { return typeof v === 'string' && /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(v); }
-function sha256(v) { return crypto.createHash('sha256').update(v).digest('hex'); }
 
 async function verifyToken(token) {
   if (!token) throw new Error('Token ausente');
@@ -82,10 +65,10 @@ async function auth(req, res, next) {
   }
 }
 
-async function getActiveUser(clientOrPool, userId, forUpdate = false) {
+async function getActiveUser(clientOrPool, userId) {
   const q = await clientOrPool.query(
-    `SELECT id,username,aura_points,giftable_points,age_bracket,is_banned,is_admin,is_test_account,moderation_role,is_organizer,aura_test_completed,deleted_at,created_at
-     FROM users WHERE id=$1 AND deleted_at IS NULL${forUpdate ? ' FOR UPDATE' : ''}`,
+    `SELECT id,username,aura_points,giftable_points,age_bracket,is_banned,is_admin,is_test_account,moderation_role,is_organizer,aura_test_completed,deleted_at
+     FROM users WHERE id=$1 AND deleted_at IS NULL`,
     [userId]
   );
   return q.rows[0] || null;
@@ -93,6 +76,7 @@ async function getActiveUser(clientOrPool, userId, forUpdate = false) {
 
 app.get('/', (req,res) => res.json({ app:'AURA STAR', version:'5.1', status:'ok' }));
 
+// ENDPOINT DE BATALLAS
 app.get('/api/battles', async (req,res) => {
   const limit = Math.min(Math.max(parseInt(req.query.limit,10)||30,1),50);
   try {
@@ -114,11 +98,21 @@ app.get('/api/battles', async (req,res) => {
     );
     res.json(q.rows);
   } catch(e) {
-    console.error('Error GET /api/battles:', e);
     res.status(500).json({ error: 'No se pudieron cargar las batallas' });
   }
 });
 
+// ENDPOINT DE RANKING
+app.get('/api/users/ranking', async (req,res) => {
+  try {
+    const q = await pool.query(`SELECT id,username,aura_points,
+      (SELECT COUNT(*) FROM battles b WHERE b.status='completed' AND b.winner_id=u.id)::int AS battles_won
+      FROM users u WHERE deleted_at IS NULL AND is_banned=false ORDER BY aura_points DESC,created_at ASC LIMIT 50`);
+    res.json(q.rows);
+  } catch(e){ res.status(500).json({error:'No se pudo cargar el ranking'}); }
+});
+
+// OBTENER MI PERFIL
 app.get('/api/users/:id', auth, async (req,res) => {
   if(req.params.id!==req.userId)return res.status(403).json({error:'No autorizado'});
   try{
@@ -131,7 +125,7 @@ app.get('/api/users/:id', auth, async (req,res) => {
   }catch(e){res.status(500).json({error:'No se pudo cargar el perfil'});}
 });
 
-// MODERACIÓN / ADMIN
+// RUTAS DE MODERACIÓN / ADMIN
 async function requireAdmin(req,res,next){
   try{
     const q=await pool.query(`SELECT is_admin,moderation_role FROM users WHERE id=$1 AND deleted_at IS NULL`,[req.userId]);
@@ -160,6 +154,23 @@ app.get('/api/admin/users/search',auth,requireAdmin,async(req,res)=>{
       FROM users WHERE deleted_at IS NULL AND (username ILIKE $1 OR id=$2) ORDER BY created_at DESC LIMIT 20`,[`%${q}%`,q]);
     res.json(r.rows);
   }catch(e){res.status(500).json({error:'Error en la búsqueda.'});}
+});
+
+app.post('/api/admin/grant-points',auth,requireAdmin,async(req,res)=>{
+  const target=String(req.body?.target_user_id||'');
+  const type=req.body?.type==='giftable'?'giftable':'aura';
+  const points=Number(req.body?.points);
+  const reason=typeof req.body?.reason==='string'?req.body.reason.trim().slice(0,200):'';
+  if(!isValidId(target)||!Number.isInteger(points)||points<1||points>1000)return res.status(400).json({error:'Cantidad inválida (1-1000).'});
+  if(target===req.userId)return res.status(400).json({error:'No podés otorgarte puntos a vos mismo.'});
+  const client=await pool.connect();
+  try{
+    await client.query('BEGIN');
+    const field=type==='giftable'?'giftable_points':'aura_points';
+    await client.query(`UPDATE users SET ${field}=${field}+$1 WHERE id=$2`,[points,target]);
+    await client.query(`INSERT INTO admin_audit_logs(admin_id,target_user_id,action_type,amount,reason) VALUES($1,$2,$3,$4,$5)`,[req.userId,target,`GRANT_${type.toUpperCase()}`,points,reason||'Premio']);
+    await client.query('COMMIT');res.json({message:'Puntos otorgados correctamente.'});
+  }catch(e){await client.query('ROLLBACK');res.status(400).json({error:e.message});}finally{client.release();}
 });
 
 const PORT=process.env.PORT||3000;
