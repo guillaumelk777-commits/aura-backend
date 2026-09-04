@@ -35,8 +35,8 @@ const REPORT_HIDE_THRESHOLD = 3;
 const DAILY_GIFT_LIMIT_PER_RECIPIENT = 50;
 const POINTS_PER_AD = 5;
 const DAILY_AD_POINTS_CAP = 60;
-const LOCAL_COST = 20;
-const TOURNAMENT_COST = Number(process.env.TOURNAMENT_COST || 20);
+const LOCAL_COST = 0;
+const TOURNAMENT_COST = Number(process.env.TOURNAMENT_COST || 0);
 const LOCAL_HOURS = 2;
 const TOURNAMENT_MAX_HOURS = 6;
 const TOURNAMENT_TIEBREAK_MINUTES = Number(process.env.TOURNAMENT_TIEBREAK_MINUTES || 30);
@@ -100,7 +100,7 @@ async function auth(req, res, next) {
 
 async function getActiveUser(clientOrPool, userId, forUpdate = false) {
   const q = await clientOrPool.query(
-    `SELECT id,username,aura_points,giftable_points,age_bracket,is_banned,deleted_at,created_at,aura_test_completed
+    `SELECT id,username,aura_points,giftable_points,age_bracket,is_banned,is_admin,is_test_account,test_created_by,moderation_role,is_organizer,aura_test_completed,deleted_at,created_at
      FROM users WHERE id=$1 AND deleted_at IS NULL${forUpdate ? ' FOR UPDATE' : ''}`,
     [userId]
   );
@@ -139,7 +139,7 @@ async function settleBattle(client, b, vc, vo, forcedWinner = null) {
   return winnerId;
 }
 
-app.get('/', (req,res) => res.json({ app:'AURA STAR', version:'4.2.1', status:'ok', share_milestones: SHARE_REWARD_MILESTONES }));
+app.get('/', (req,res) => res.json({ app:'AURA STAR', version:'5.1', status:'ok', share_milestones: SHARE_REWARD_MILESTONES }));
 
 app.post('/api/users', auth, rateLimit({windowMs:60000,max:20}), async (req,res) => {
   const username = typeof req.body?.username === 'string' ? req.body.username.trim().slice(0,40) : null;
@@ -150,7 +150,7 @@ app.post('/api/users', auth, rateLimit({windowMs:60000,max:20}), async (req,res)
     const q = await pool.query(
       `INSERT INTO users(id,username,age_bracket) VALUES($1,$2,$3)
        ON CONFLICT(id) DO UPDATE SET username=COALESCE(NULLIF($2,''),users.username),age_bracket=COALESCE($3,users.age_bracket)
-       RETURNING id,username,aura_points,giftable_points,age_bracket,is_banned,created_at,aura_test_completed`,
+       RETURNING id,username,aura_points,giftable_points,age_bracket,is_banned,is_admin,is_test_account,test_created_by,moderation_role,is_organizer,aura_test_completed,created_at`,
       [req.userId,username,age || null]
     );
     res.json(q.rows[0]);
@@ -207,7 +207,7 @@ app.get('/api/users/:id', auth, async (req,res) => {
     const stats=await pool.query(`SELECT
       (SELECT COUNT(*) FROM battles WHERE status='completed' AND winner_id=$1)::int battles_won,
       (SELECT COUNT(*) FROM battles WHERE creator_id=$1 OR opponent_id=$1 OR local_participant_a=$1 OR local_participant_b=$1)::int battles_played`,[req.userId]);
-    res.json({...u,...stats.rows[0]});
+    res.json({...u,...stats.rows[0],is_moderator:!!(u.is_admin||u.moderation_role==='admin'||u.moderation_role==='moderator'),is_organizer:!!u.is_organizer});
   }catch(e){res.status(500).json({error:'No se pudo cargar el perfil'});}
 });
 
@@ -250,9 +250,6 @@ app.post('/api/battles', auth, rateLimit({windowMs:60000,max:20}), async (req,re
   const mode=String(req.body?.mode||'video');
   const category=String(req.body?.category||'');
   const title=typeof req.body?.title==='string'?req.body.title.trim().slice(0,80):'';
-  const themeRaw=typeof req.body?.theme==='string'?req.body.theme.trim().slice(0,120):'';
-  const theme=themeRaw.length > 0 ? themeRaw : null;
-
   if(!MODES.includes(mode)||!CATEGORIES.includes(category)||!title)return res.status(400).json({error:'Datos de batalla inválidos'});
   const client=await pool.connect();
   try{
@@ -266,13 +263,13 @@ app.post('/api/battles', auth, rateLimit({windowMs:60000,max:20}), async (req,re
       if(!isValidId(a)||!isValidId(b)||a===b)throw Error('Los dos competidores deben ser válidos y distintos.');
       const pa=await getActiveUser(client,a);const pb=await getActiveUser(client,b);if(!pa||!pb)throw Error('Uno de los competidores no existe o no está disponible.');
       const cost=LOCAL_COST;
-      if(user.giftable_points<cost)throw Error(`Necesitás ${cost} puntos regalables para crear una batalla local.`);
-      await client.query('UPDATE users SET giftable_points=giftable_points-$1 WHERE id=$2',[cost,req.userId]);
-      const r=await client.query(`INSERT INTO battles(creator_id,mode,category,title,theme,local_participant_a,local_participant_b,local_neutral,local_closes_at,status)
-        VALUES($1,'local',$2,$3,$4,$5,$6,$7,NOW()+INTERVAL '2 hours','active') RETURNING *`,[req.userId,category,title,theme,a,b,neutral]);row=r.rows[0];
+      if(cost > 0 && user.giftable_points<cost)throw Error(`Necesitás ${cost} puntos regalables para crear una batalla local.`);
+      if(cost > 0) await client.query('UPDATE users SET giftable_points=giftable_points-$1 WHERE id=$2',[cost,req.userId]);
+      const r=await client.query(`INSERT INTO battles(creator_id,mode,category,title,local_participant_a,local_participant_b,local_neutral,local_closes_at,status)
+        VALUES($1,'local',$2,$3,$4,$5,$6,NOW()+INTERVAL '2 hours','active') RETURNING *`,[req.userId,category,title,a,b,neutral]);row=r.rows[0];
     }else{
       const url=req.body?.media_url_creator;if(!validateMediaUrl(url))throw Error('La participación del creador es obligatoria y debe ser una URL HTTPS válida.');
-      const r=await client.query(`INSERT INTO battles(creator_id,mode,category,title,theme,media_url_creator,status) VALUES($1,$2,$3,$4,$5,$6,'active') RETURNING *`,[req.userId,mode,category,title,theme,url]);row=r.rows[0];
+      const r=await client.query(`INSERT INTO battles(creator_id,mode,category,title,media_url_creator,status) VALUES($1,$2,$3,$4,$5,'active') RETURNING *`,[req.userId,mode,category,title,url]);row=r.rows[0];
     }
     await client.query('COMMIT');res.status(201).json(row);
   }catch(e){await client.query('ROLLBACK');res.status(400).json({error:e.message});}finally{client.release();}
@@ -347,8 +344,8 @@ async function advanceTournamentMatch(client,b,winnerId){
   const fresh=(await client.query('SELECT * FROM tournament_matches WHERE id=$1 FOR UPDATE',[nm.id])).rows[0];
   if(fresh.player_a_id&&fresh.player_b_id&&fresh.status!=='active'){
     await client.query(`UPDATE tournament_matches SET status='ready' WHERE id=$1`,[fresh.id]);
-    const br=await client.query(`INSERT INTO battles(creator_id,mode,category,title,theme,local_participant_a,local_participant_b,local_neutral,local_closes_at,status,tournament_id,tournament_match_id,tournament_round,tournament_match)
-      VALUES($1,'local',$2,$3,$4,$5,$6,true,NOW()+INTERVAL '2 hours','active',$7,$8,$9,$10) RETURNING id`,[tq.organizer_id,tq.category,`${tq.title} · Ronda ${nextRound}`,tq.description,fresh.player_a_id,fresh.player_b_id,tq.id,fresh.id,nextRound,nextMatchNumber]);
+    const br=await client.query(`INSERT INTO battles(creator_id,mode,category,title,local_participant_a,local_participant_b,local_neutral,local_closes_at,status,tournament_id,tournament_match_id,tournament_round,tournament_match)
+      VALUES($1,'local',$2,$3,$4,$5,true,NOW()+INTERVAL '2 hours','active',$6,$7,$8,$9) RETURNING id`,[tq.organizer_id,tq.category,`${tq.title} · Ronda ${nextRound}`,fresh.player_a_id,fresh.player_b_id,tq.id,fresh.id,nextRound,nextMatchNumber]);
     await client.query(`UPDATE tournament_matches SET status='active' WHERE id=$1`,[fresh.id]);
     await client.query(`UPDATE tournaments SET current_round=$1,status='live' WHERE id=$2`,[nextRound,tq.id]);
   }
@@ -367,7 +364,7 @@ app.post('/api/battles/:id/report', auth, rateLimit({windowMs:60000,max:20}), as
 
 app.get('/api/battles/local/search', auth, async (req,res) => {
   const q=typeof req.query.q==='string'?req.query.q.trim().slice(0,80):'';if(q.length<2)return res.json([]);
-  try{const r=await pool.query(`SELECT b.id,b.title,b.theme,b.votes_creator,b.votes_opponent,b.local_closes_at,
+  try{const r=await pool.query(`SELECT b.id,b.title,b.votes_creator,b.votes_opponent,b.local_closes_at,
     ua.username local_a_name,ub.username local_b_name FROM battles b
     LEFT JOIN users ua ON ua.id=b.local_participant_a LEFT JOIN users ub ON ub.id=b.local_participant_b
     WHERE b.mode='local' AND b.status='active' AND b.hidden=false AND b.title ILIKE $1 ORDER BY b.created_at DESC LIMIT 30`,[`%${q}%`]);res.json(r.rows);
@@ -399,7 +396,103 @@ app.post('/api/share/claim', auth, rateLimit({windowMs:60000,max:10}), async (re
     const count=Number((await client.query('SELECT COUNT(*)::int count FROM share_referrals WHERE referrer_id=$1',[referrer])).rows[0].count);
     let credited=0;
     for(const m of SHARE_REWARD_MILESTONES){if(count>=m.users){const ins=await client.query(`INSERT INTO share_rewards(user_id,milestone_users,aura_points) VALUES($1,$2,$3) ON CONFLICT(user_id,milestone_users) DO NOTHING RETURNING id`,[referrer,m.users,m.points]);if(ins.rowCount){await client.query('UPDATE users SET aura_points=aura_points+$1 WHERE id=$2',[m.points,referrer]);credited+=m.points;}}}
-    await client.query('COMMIT');res.json({message:credited?`¡Invitación verified! Se otorgaron ${credited} puntos Aura.`:'Invitación verificada.',credited,verified_users:count});
+    await client.query('COMMIT');res.json({message:credited?`¡Invitación verificada! Se otorgaron ${credited} puntos Aura.`:'Invitación verificada.',credited,verified_users:count});
+  }catch(e){await client.query('ROLLBACK');res.status(400).json({error:e.message});}finally{client.release();}
+});
+
+// MODERACIÓN Y ADMINISTRACIÓN
+async function requireAdmin(req,res,next){
+  try{
+    const q=await pool.query(`SELECT is_admin,moderation_role FROM users WHERE id=$1 AND deleted_at IS NULL`,[req.userId]);
+    const u=q.rows[0];
+    if(!u || !(u.is_admin===true || u.moderation_role==='admin')) return res.status(403).json({error:'Acceso denegado: se requieren permisos de administrador.'});
+    next();
+  }catch(e){res.status(500).json({error:'No se pudieron verificar los permisos de administrador.'});}
+}
+
+app.get('/api/admin/summary',auth,requireAdmin,async(req,res)=>{
+  try{
+    const [u,b,a]=await Promise.all([
+      pool.query(`SELECT COUNT(*)::int count FROM users WHERE deleted_at IS NULL`),
+      pool.query(`SELECT COUNT(*)::int count FROM battles WHERE status='active' AND hidden=false`),
+      pool.query(`SELECT COALESCE(SUM(amount),0)::int total FROM admin_audit_logs WHERE action_type='GRANT_AURA' AND created_at>=date_trunc('day',NOW())`)
+    ]);
+    res.json({users:u.rows[0].count,active_battles:b.rows[0].count,aura_granted_today:a.rows[0].total});
+  }catch(e){res.status(500).json({error:'No se pudo cargar el resumen.'});}
+});
+
+app.get('/api/admin/users/search',auth,requireAdmin,async(req,res)=>{
+  const q=String(req.query.q||'').trim();
+  if(q.length<2)return res.json([]);
+  try{
+    const r=await pool.query(`SELECT id,username,aura_points,giftable_points,is_banned,is_test_account,test_created_by,moderation_role,is_organizer,created_at
+      FROM users WHERE deleted_at IS NULL AND (username ILIKE $1 OR id=$2) ORDER BY created_at DESC LIMIT 20`,[`%${q}%`,q]);
+    res.json(r.rows);
+  }catch(e){res.status(500).json({error:'No se pudo buscar usuarios.'});}
+});
+
+app.post('/api/admin/grant-points',auth,requireAdmin,async(req,res)=>{
+  const target=String(req.body?.target_user_id||'');
+  const type=req.body?.type==='giftable'?'giftable':'aura';
+  const points=Number(req.body?.points);
+  const reason=typeof req.body?.reason==='string'?req.body.reason.trim().slice(0,200):'';
+  if(!isValidId(target)||!Number.isInteger(points)||points<1||points>1000)return res.status(400).json({error:'La cantidad debe ser un entero entre 1 y 1000.'});
+  if(target===req.userId)return res.status(400).json({error:'No podés otorgarte puntos a vos mismo desde el panel.'});
+  const client=await pool.connect();
+  try{
+    await client.query('BEGIN');
+    const u=(await client.query(`SELECT id FROM users WHERE id=$1 AND deleted_at IS NULL AND is_banned=false FOR UPDATE`,[target])).rows[0];
+    if(!u)throw Error('Usuario no disponible.');
+    const field=type==='giftable'?'giftable_points':'aura_points';
+    await client.query(`UPDATE users SET ${field}=${field}+$1 WHERE id=$2`,[points,target]);
+    await client.query(`INSERT INTO admin_audit_logs(admin_id,target_user_id,action_type,amount,reason) VALUES($1,$2,$3,$4,$5)`,[req.userId,target,`GRANT_${type.toUpperCase()}`,points,reason||'Premio / promoción']);
+    await client.query('COMMIT');res.json({message:'Puntos otorgados correctamente.'});
+  }catch(e){await client.query('ROLLBACK');res.status(400).json({error:e.message});}finally{client.release();}
+});
+
+app.post('/api/admin/set-organizer',auth,requireAdmin,async(req,res)=>{
+  const target=String(req.body?.target_user_id||'');
+  const enabled=req.body?.enabled!==false;
+  if(!isValidId(target)||target===req.userId)return res.status(400).json({error:'Usuario inválido.'});
+  try{
+    const r=await pool.query(`UPDATE users SET is_organizer=$1 WHERE id=$2 AND deleted_at IS NULL RETURNING id,username,is_organizer`,[enabled,target]);
+    if(!r.rowCount)return res.status(404).json({error:'Usuario no encontrado.'});
+    await pool.query(`INSERT INTO admin_audit_logs(admin_id,target_user_id,action_type,reason) VALUES($1,$2,$3,$4)`,[req.userId,target,enabled?'SET_ORGANIZER':'REMOVE_ORGANIZER',enabled?'Usuario designado como organizador':'Rol de organizador retirado']);
+    res.json({message:enabled?'Usuario designado como organizador.':'Rol de organizador retirado.',user:r.rows[0]});
+  }catch(e){res.status(400).json({error:'No se pudo actualizar el estado de organizador.'});}
+});
+
+app.post('/api/admin/mark-test-user',auth,requireAdmin,async(req,res)=>{
+  const target=String(req.body?.target_user_id||'');
+  if(!isValidId(target)||target===req.userId)return res.status(400).json({error:'Usuario de prueba inválido.'});
+  try{
+    const r=await pool.query(`UPDATE users SET is_test_account=true,test_created_by=$1 WHERE id=$2 AND deleted_at IS NULL RETURNING id,username`,[req.userId,target]);
+    if(!r.rowCount)return res.status(404).json({error:'Usuario no encontrado.'});
+    await pool.query(`INSERT INTO admin_audit_logs(admin_id,target_user_id,action_type,reason) VALUES($1,$2,'MARK_TEST','Cuenta marcada como prueba')`,[req.userId,target]);
+    res.json({message:'Cuenta marcada como prueba.'});
+  }catch(e){res.status(400).json({error:'No se pudo marcar la cuenta.'});}
+});
+
+app.post('/api/admin/suspend-user',auth,requireAdmin,async(req,res)=>{
+  const target=String(req.body?.target_user_id||''),reason=typeof req.body?.reason==='string'?req.body.reason.trim().slice(0,200):'Moderación';
+  if(!isValidId(target)||target===req.userId)return res.status(400).json({error:'No podés suspender esta cuenta.'});
+  const client=await pool.connect();
+  try{await client.query('BEGIN');const r=await client.query(`UPDATE users SET is_banned=true WHERE id=$1 AND deleted_at IS NULL RETURNING id`,[target]);if(!r.rowCount)throw Error('Usuario no encontrado.');await client.query(`UPDATE battles SET status='cancelled',closed_at=NOW() WHERE status='active' AND (creator_id=$1 OR opponent_id=$1 OR local_participant_a=$1 OR local_participant_b=$1)`,[target]);await client.query(`INSERT INTO admin_audit_logs(admin_id,target_user_id,action_type,reason) VALUES($1,$2,'SUSPEND_USER',$3)`,[req.userId,target,reason]);await client.query('COMMIT');res.json({message:'Usuario suspendido y batallas activas canceladas.'});}catch(e){await client.query('ROLLBACK');res.status(400).json({error:e.message});}finally{client.release();}
+});
+
+app.post('/api/admin/delete-test-user',auth,requireAdmin,async(req,res)=>{
+  const target=String(req.body?.target_user_id||'');
+  if(!isValidId(target)||target===req.userId)return res.status(400).json({error:'No podés eliminar esta cuenta.'});
+  const client=await pool.connect();
+  try{
+    await client.query('BEGIN');
+    const u=(await client.query(`SELECT id,is_test_account,test_created_by FROM users WHERE id=$1 AND deleted_at IS NULL FOR UPDATE`,[target])).rows[0];
+    if(!u)throw Error('Usuario no encontrado.');
+    if(!u.is_test_account || u.test_created_by!==req.userId)throw Error('Por seguridad, solo podés eliminar cuentas de prueba creadas y marcadas por tu cuenta.');
+    await client.query(`UPDATE battles SET status='cancelled',closed_at=NOW() WHERE status='active' AND (creator_id=$1 OR opponent_id=$1 OR local_participant_a=$1 OR local_participant_b=$1)`,[target]);
+    await client.query(`UPDATE users SET username=NULL,is_banned=true,deleted_at=NOW() WHERE id=$1`,[target]);
+    await client.query(`INSERT INTO admin_audit_logs(admin_id,target_user_id,action_type,reason) VALUES($1,$2,'DELETE_TEST_USER','Eliminación de cuenta de prueba')`,[req.userId,target]);
+    await client.query('COMMIT');res.json({message:'Cuenta de prueba eliminada.'});
   }catch(e){await client.query('ROLLBACK');res.status(400).json({error:e.message});}finally{client.release();}
 });
 
@@ -437,10 +530,14 @@ app.post('/api/tournaments', auth, rateLimit({windowMs:60000,max:10}), async (re
     const user=await getActiveUser(client,req.userId,true);if(!user||user.is_banned)throw Error('Cuenta no disponible');
     if(!user.age_bracket)throw Error('Tu perfil debe tener una franja etaria antes de crear un torneo.');
     if(user.age_bracket!==age)throw Error('El organizador debe pertenecer a la misma franja etaria del torneo.');
-    if(user.giftable_points<TOURNAMENT_COST)throw Error(`Necesitás ${TOURNAMENT_COST} puntos regalables para crear el torneo.`);
+    
+    if(TOURNAMENT_COST > 0 && user.giftable_points < TOURNAMENT_COST) throw Error(`Necesitás ${TOURNAMENT_COST} puntos regalables para crear el torneo.`);
+    
     const active=await client.query(`SELECT COUNT(*)::int count FROM tournaments WHERE organizer_id=$1 AND status IN ('registration','live')`,[req.userId]);
     if(Number(active.rows[0].count)>=3)throw Error('Máximo 3 torneos activos por organizador.');
-    await client.query('UPDATE users SET giftable_points=giftable_points-$1 WHERE id=$2',[TOURNAMENT_COST,req.userId]);
+    
+    if(TOURNAMENT_COST > 0) await client.query('UPDATE users SET giftable_points=giftable_points-$1 WHERE id=$2',[TOURNAMENT_COST,req.userId]);
+    
     const code=newToken().slice(0,10).toUpperCase();
     const r=await client.query(`INSERT INTO tournaments(organizer_id,title,category,description,size,age_bracket,mode,status,starts_at,closes_at,latitude,longitude,event_code,organizer_disclaimer_accepted,entry_cost_points)
       VALUES($1,$2,$3,$4,$5,$6,'local','registration',COALESCE($7,NOW()),COALESCE($7,NOW())+INTERVAL '6 hours',$8,$9,$10,true,$11) RETURNING *`,
@@ -484,8 +581,8 @@ app.post('/api/tournaments/:id/join', auth, rateLimit({windowMs:60000,max:20}), 
       const pairs=[];for(let i=0;i<t.size;i+=2)pairs.push([ps[i].user_id,ps[i+1].user_id]);
       for(let i=0;i<pairs.length;i++){
         const mr=await client.query(`INSERT INTO tournament_matches(tournament_id,round,match_number,player_a_id,player_b_id,status) VALUES($1,1,$2,$3,$4,'ready') RETURNING id`,[t.id,i+1,pairs[i][0],pairs[i][1]]);
-        await client.query(`INSERT INTO battles(creator_id,mode,category,title,theme,local_participant_a,local_participant_b,local_neutral,local_closes_at,status,tournament_id,tournament_match_id,tournament_round,tournament_match)
-          VALUES($1,'local',$2,$3,$4,$5,$6,true,NOW()+INTERVAL '2 hours','active',$7,$8,1,$9)`,[t.organizer_id,t.category,`${t.title} · Ronda 1`,t.description,pairs[i][0],pairs[i][1],t.id,mr.rows[0].id,i+1]);
+        await client.query(`INSERT INTO battles(creator_id,mode,category,title,local_participant_a,local_participant_b,local_neutral,local_closes_at,status,tournament_id,tournament_match_id,tournament_round,tournament_match)
+          VALUES($1,'local',$2,$3,$4,$5,true,NOW()+INTERVAL '2 hours','active',$6,$7,1,$8)`,[t.organizer_id,t.category,`${t.title} · Ronda 1`,pairs[i][0],pairs[i][1],t.id,mr.rows[0].id,i+1]);
       }
       await client.query(`UPDATE tournaments SET status='live',current_round=1 WHERE id=$1`,[t.id]);
     }
@@ -564,4 +661,4 @@ setInterval(expireLocalBattles,60000);
 app.use((err,req,res,next)=>{console.error(err);res.status(500).json({error:'Error de servidor'});});
 app.use((req,res)=>res.status(404).json({error:'No encontrado'}));
 
-const PORT=process.env.PORT||3000;app.listen(PORT,()=>console.log(`AURA STAR API v4.2.1 en puerto ${PORT}`));
+const PORT=process.env.PORT||3000;app.listen(PORT,()=>console.log(`AURA STAR API v5.1 en puerto ${PORT}`));
