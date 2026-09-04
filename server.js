@@ -41,8 +41,7 @@ const MIN_DIFF = 3;
 
 const SHARE_REWARD_MILESTONES = parseMilestones(process.env.SHARE_REWARD_MILESTONES || '5:5,10:10,25:25');
 const SHARE_BASE_URL = (process.env.SHARE_BASE_URL || process.env.FRONTEND_ORIGIN || '').replace(/\/$/, '');
-const SHARE_TOKEN_SECRET = process.env.SHARE_TOKEN_SECRET || '';
-const REVENUECAT_WEBHOOK_SECRET = process.env.REVENUECAT_WEBHOOK_SECRET || '';
+const SHARE_TOKEN_SECRET = process.env.SHARE_TOKEN_SECRET || 'aura_share_secret_default_key';
 
 const PRODUCTS = {
   starter: { points: 50 },
@@ -62,7 +61,6 @@ function parseMilestones(raw) {
 function isValidId(v) { return typeof v === 'string' && v.trim().length > 0 && v.length <= 200; }
 function isUuid(v) { return typeof v === 'string' && /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(v); }
 function sha256(v) { return crypto.createHash('sha256').update(v).digest('hex'); }
-function newToken() { return crypto.randomBytes(32).toString('base64url'); }
 
 async function verifyToken(token) {
   if (!token) throw new Error('Token ausente');
@@ -105,28 +103,6 @@ async function activeBattleCount(client, userId) {
 }
 
 function validateMediaUrl(v) { return typeof v === 'string' && /^https:\/\//i.test(v) && v.length <= 2048; }
-
-function winnerFor(b, vc, vo) {
-  if (!b.opponent_id || vc === vo || vc + vo < MIN_VOTES || Math.abs(vc - vo) < MIN_DIFF) return null;
-  return vc > vo ? b.creator_id : b.opponent_id;
-}
-
-async function settleBattle(client, b, vc, vo, forcedWinner = null) {
-  const winnerId = forcedWinner || winnerFor(b, vc, vo);
-  if (!winnerId) return null;
-  const loserId = winnerId === b.creator_id ? b.opponent_id : b.creator_id;
-  await client.query('UPDATE users SET aura_points=aura_points+20 WHERE id=$1', [winnerId]);
-  await client.query('UPDATE users SET aura_points=GREATEST(0,aura_points-5) WHERE id=$1', [loserId]);
-  await client.query(
-    `UPDATE battles SET votes_creator=$1,votes_opponent=$2,status='completed',winner_id=$3,closed_at=NOW() WHERE id=$4`,
-    [vc, vo, winnerId, b.id]
-  );
-  return winnerId;
-}
-
-// ----------------------------------------------------
-// RUTAS PRINCIPALES DE LA API
-// ----------------------------------------------------
 
 app.get('/', (req,res) => res.json({ app:'AURA STAR', version:'5.1', status:'ok' }));
 
@@ -257,6 +233,31 @@ app.post('/api/battles', auth, rateLimit({windowMs:60000,max:20}), async (req,re
   } finally { client.release(); }
 });
 
+// SISTEMA DE REFERIDOS Y COMPARTIR
+app.get('/api/share', auth, async (req,res) => {
+  try {
+    const token = crypto.createHmac('sha256', SHARE_TOKEN_SECRET).update(`aura-share-v2:${req.userId}`).digest('base64url');
+    const tokenHash = sha256(token);
+    await pool.query('INSERT INTO share_invites(user_id,token_hash) VALUES($1,$2) ON CONFLICT(user_id) DO UPDATE SET token_hash=EXCLUDED.token_hash', [req.userId, tokenHash]);
+    const countQ = await pool.query('SELECT COUNT(*)::int count FROM share_referrals WHERE referrer_id=$1', [req.userId]);
+    const awardedQ = await pool.query('SELECT COALESCE(SUM(aura_points),0)::int total FROM share_rewards WHERE user_id=$1', [req.userId]);
+    
+    const count = countQ.rows[0].count;
+    const totalAwarded = awardedQ.rows[0].total;
+    const next = SHARE_REWARD_MILESTONES.find(x => x.users > count) || null;
+    
+    res.json({
+      share_url: `${SHARE_BASE_URL || '/'}/?ref=${encodeURIComponent(token)}`,
+      verified_users: count,
+      total_aura_awarded: totalAwarded,
+      next_milestone: next,
+      milestones: SHARE_REWARD_MILESTONES
+    });
+  } catch(e) {
+    res.status(500).json({error: 'No se pudo preparar el enlace de compartir'});
+  }
+});
+
 // TEST DE AURA INICIAL
 app.post('/api/users/aura-test', auth, rateLimit({ windowMs: 60000, max: 5 }), async (req, res) => {
   const client = await pool.connect();
@@ -291,10 +292,7 @@ app.post('/api/users/aura-test', auth, rateLimit({ windowMs: 60000, max: 5 }), a
   }
 });
 
-// ----------------------------------------------------
 // RUTAS DE MODERACIÓN / ADMIN
-// ----------------------------------------------------
-
 async function requireAdmin(req,res,next){
   try{
     const q = await pool.query(`SELECT is_admin,moderation_role FROM users WHERE id=$1 AND deleted_at IS NULL`,[req.userId]);
@@ -343,37 +341,6 @@ app.post('/api/admin/grant-points', auth, requireAdmin, async (req,res) => {
     await client.query(`INSERT INTO admin_audit_logs(admin_id,target_user_id,action_type,amount,reason) VALUES($1,$2,$3,$4,$5)`, [req.userId, target, `GRANT_${type.toUpperCase()}`, points, reason||'Premio']);
     await client.query('COMMIT');
     res.json({message:'Puntos otorgados correctamente.'});
-  } catch(e) {
-    await client.query('ROLLBACK');
-    res.status(400).json({error: e.message});
-  } finally { client.release(); }
-});
-
-app.post('/api/admin/set-organizer', auth, requireAdmin, async (req,res) => {
-  const target = String(req.body?.target_user_id||'');
-  const enabled = req.body?.enabled !== false;
-  if(!isValidId(target) || target===req.userId) return res.status(400).json({error:'Usuario inválido.'});
-  try {
-    const r = await pool.query(`UPDATE users SET is_organizer=$1 WHERE id=$2 AND deleted_at IS NULL RETURNING id,username,is_organizer`, [enabled, target]);
-    if(!r.rowCount) return res.status(404).json({error:'Usuario no encontrado.'});
-    await pool.query(`INSERT INTO admin_audit_logs(admin_id,target_user_id,action_type,reason) VALUES($1,$2,$3,$4)`, [req.userId, target, enabled?'SET_ORGANIZER':'REMOVE_ORGANIZER', enabled?'Designado organizador':'Quitado organizador']);
-    res.json({message: enabled ? 'Usuario designado como organizador.' : 'Rol retirado.'});
-  } catch(e) { res.status(400).json({error:'Error al cambiar rol.'}); }
-});
-
-app.post('/api/admin/suspend-user', auth, requireAdmin, async (req,res) => {
-  const target = String(req.body?.target_user_id||'');
-  const reason = typeof req.body?.reason==='string' ? req.body.reason.trim().slice(0,200) : 'Moderación';
-  if(!isValidId(target) || target===req.userId) return res.status(400).json({error:'No podés suspender esta cuenta.'});
-  const client = await pool.connect();
-  try {
-    await client.query('BEGIN');
-    const r = await client.query(`UPDATE users SET is_banned=true WHERE id=$1 AND deleted_at IS NULL RETURNING id`, [target]);
-    if(!r.rowCount) throw Error('Usuario no encontrado.');
-    await client.query(`UPDATE battles SET status='cancelled',closed_at=NOW() WHERE status='active' AND (creator_id=$1 OR opponent_id=$1 OR local_participant_a=$1 OR local_participant_b=$1)`, [target]);
-    await client.query(`INSERT INTO admin_audit_logs(admin_id,target_user_id,action_type,reason) VALUES($1,$2,'SUSPEND_USER',$3)`, [req.userId, target, reason]);
-    await client.query('COMMIT');
-    res.json({message:'Usuario suspendido.'});
   } catch(e) {
     await client.query('ROLLBACK');
     res.status(400).json({error: e.message});
