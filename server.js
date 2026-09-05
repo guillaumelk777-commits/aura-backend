@@ -115,7 +115,7 @@ async function settleBattle(client, b, vc, vo, forcedWinner = null) {
   return winnerId;
 }
 
-app.get('/', (req,res) => res.json({ app:'AURA STAR', version:'5.3', status:'ok' }));
+app.get('/', (req,res) => res.json({ app:'AURA STAR', version:'5.4', status:'ok' }));
 
 // CREAR/ACTUALIZAR USUARIO
 app.post('/api/users', auth, rateLimit({windowMs:60000,max:20}), async (req,res) => {
@@ -289,7 +289,7 @@ app.post('/api/battles/:id/join', auth, rateLimit({windowMs:60000,max:20}), asyn
   } finally { client.release(); }
 });
 
-// VOTAR EN BATALLA
+// VOTAR EN BATALLA (CON VALIDACIÓN DE OPONENTE)
 app.post('/api/battles/:id/vote', auth, rateLimit({windowMs:60000,max:30}), async (req,res) => {
   const target = req.body?.voted_user_id;
   if(!isValidId(target)) return res.status(400).json({error:'Participante inválido.'});
@@ -303,6 +303,11 @@ app.post('/api/battles/:id/vote', auth, rateLimit({windowMs:60000,max:30}), asyn
     const b = q.rows[0];
     if(!b || b.status!=='active') throw Error('La batalla no está activa.');
     
+    // REGLA DE JUEGO LIMPIO: Si la batalla no tiene oponente o no subió contenido, no se permite votar
+    if (!b.opponent_id || (b.mode !== 'local' && !b.media_url_opponent)) {
+      throw Error('La votación estará disponible cuando se una un oponente con su contenido.');
+    }
+
     const pa = b.mode === 'local' ? b.local_participant_a : b.creator_id;
     const pb = b.mode === 'local' ? b.local_participant_b : b.opponent_id;
     
@@ -496,4 +501,4 @@ app.use((err,req,res,next) => { console.error(err); res.status(500).json({error:
 app.use((req,res) => res.status(404).json({error:'Ruta no encontrada'}));
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`AURA STAR API v5.3 en puerto ${PORT}`));
+app.listen(PORT, () => console.log(`AURA STAR API v5.4 en puerto ${PORT}`));
