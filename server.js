@@ -4,6 +4,7 @@ const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
 const crypto = require('crypto');
 const { Pool } = require('pg');
+const { MercadoPagoConfig, Preference, Payment } = require('mercadopago');
 
 const app = express();
 app.set('trust proxy', 1);
@@ -37,6 +38,15 @@ const MIN_DIFF = 3;
 const SHARE_REWARD_MILESTONES = parseMilestones(process.env.SHARE_REWARD_MILESTONES || '5:5,10:10,25:25');
 const SHARE_BASE_URL = (process.env.SHARE_BASE_URL || process.env.FRONTEND_ORIGIN || '').replace(/\/$/, '');
 const SHARE_TOKEN_SECRET = process.env.SHARE_TOKEN_SECRET || 'aura_share_secret_default_key';
+
+// Mercado Pago Setup
+const mpClient = new MercadoPagoConfig({ accessToken: process.env.MP_ACCESS_TOKEN || '' });
+const PRICING = {
+  starter: { points: 50, price: 2000, title: '50 Puntos Regalables — AURA STAR' },
+  plus:    { points: 120, price: 4500, title: '120 Puntos Regalables — AURA STAR' },
+  pro:     { points: 300, price: 10000, title: '300 Puntos Regalables — AURA STAR' },
+  mega:    { points: 700, price: 22000, title: '700 Puntos Regalables — AURA STAR' }
+};
 
 function parseMilestones(raw) {
   const out = raw.split(',').map(x => x.trim()).map(x => {
@@ -115,7 +125,68 @@ async function settleBattle(client, b, vc, vo, forcedWinner = null) {
   return winnerId;
 }
 
-app.get('/', (req,res) => res.json({ app:'AURA STAR', version:'5.4', status:'ok' }));
+app.get('/', (req,res) => res.json({ app:'AURA STAR', version:'5.5', status:'ok' }));
+
+// MERCADO PAGO: Crear Checkout Pro
+app.post('/api/payments/create-checkout', auth, async (req, res) => {
+  const packageId = req.body?.package_id;
+  const pack = PRICING[packageId];
+  if (!pack) return res.status(400).json({ error: 'Paquete de puntos inválido.' });
+
+  try {
+    const preference = new Preference(mpClient);
+    const result = await preference.create({
+      body: {
+        items: [{
+          id: packageId,
+          title: pack.title,
+          unit_price: pack.price,
+          quantity: 1,
+          currency_id: 'ARS'
+        }],
+        metadata: {
+          user_id: req.userId,
+          package_id: packageId,
+          points: pack.points
+        },
+        back_urls: {
+          success: `${process.env.FRONTEND_ORIGIN || 'https://guillaumelk777-commits.github.io/aura-star-frontend/'}?payment=success`,
+          failure: `${process.env.FRONTEND_ORIGIN || 'https://guillaumelk777-commits.github.io/aura-star-frontend/'}?payment=failure`
+        },
+        auto_return: 'approved'
+      }
+    });
+
+    res.json({ init_point: result.init_point });
+  } catch (e) {
+    console.error('Error MP Preference:', e);
+    res.status(500).json({ error: 'No se pudo generar el checkout de Mercado Pago.' });
+  }
+});
+
+// MERCADO PAGO: Webhook de Acreditación
+app.post('/api/payments/webhook', async (req, res) => {
+  const { type, data } = req.body || {};
+  if (type === 'payment' && data?.id) {
+    try {
+      const payment = new Payment(mpClient);
+      const payInfo = await payment.get({ id: data.id });
+
+      if (payInfo.status === 'approved') {
+        const { user_id, points } = payInfo.metadata || {};
+        if (user_id && points) {
+          await pool.query(
+            'UPDATE users SET giftable_points = giftable_points + $1 WHERE id = $2',
+            [Number(points), user_id]
+          );
+        }
+      }
+    } catch (e) {
+      console.error('Error procesando Webhook MP:', e);
+    }
+  }
+  res.sendStatus(200);
+});
 
 // CREAR/ACTUALIZAR USUARIO
 app.post('/api/users', auth, rateLimit({windowMs:60000,max:20}), async (req,res) => {
@@ -289,7 +360,7 @@ app.post('/api/battles/:id/join', auth, rateLimit({windowMs:60000,max:20}), asyn
   } finally { client.release(); }
 });
 
-// VOTAR EN BATALLA (CON VALIDACIÓN DE OPONENTE)
+// VOTAR EN BATALLA
 app.post('/api/battles/:id/vote', auth, rateLimit({windowMs:60000,max:30}), async (req,res) => {
   const target = req.body?.voted_user_id;
   if(!isValidId(target)) return res.status(400).json({error:'Participante inválido.'});
@@ -303,7 +374,6 @@ app.post('/api/battles/:id/vote', auth, rateLimit({windowMs:60000,max:30}), asyn
     const b = q.rows[0];
     if(!b || b.status!=='active') throw Error('La batalla no está activa.');
     
-    // REGLA DE JUEGO LIMPIO: Si la batalla no tiene oponente o no subió contenido, no se permite votar
     if (!b.opponent_id || (b.mode !== 'local' && !b.media_url_opponent)) {
       throw Error('La votación estará disponible cuando se una un oponente con su contenido.');
     }
@@ -410,10 +480,7 @@ app.post('/api/users/aura-test', auth, rateLimit({ windowMs: 60000, max: 5 }), a
   }
 });
 
-// ----------------------------------------------------
 // RUTAS DE MODERACIÓN / ADMIN
-// ----------------------------------------------------
-
 async function requireAdmin(req,res,next){
   try{
     const q = await pool.query(`SELECT is_admin,moderation_role FROM users WHERE id=$1 AND deleted_at IS NULL`,[req.userId]);
@@ -501,4 +568,4 @@ app.use((err,req,res,next) => { console.error(err); res.status(500).json({error:
 app.use((req,res) => res.status(404).json({error:'Ruta no encontrada'}));
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`AURA STAR API v5.4 en puerto ${PORT}`));
+app.listen(PORT, () => console.log(`AURA STAR API v5.5 en puerto ${PORT}`));
