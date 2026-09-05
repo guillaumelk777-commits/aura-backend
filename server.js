@@ -4,7 +4,19 @@ const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
 const crypto = require('crypto');
 const { Pool } = require('pg');
-const { MercadoPagoConfig, Preference, Payment } = require('mercadopago');
+
+let MercadoPagoConfig, Preference, Payment, mpClient;
+try {
+  const mpModule = require('mercadopago');
+  MercadoPagoConfig = mpModule.MercadoPagoConfig;
+  Preference = mpModule.Preference;
+  Payment = mpModule.Payment;
+  if (process.env.MP_ACCESS_TOKEN) {
+    mpClient = new MercadoPagoConfig({ accessToken: process.env.MP_ACCESS_TOKEN });
+  }
+} catch (e) {
+  console.warn('⚠️ SDK de Mercado Pago no encontrado.');
+}
 
 const app = express();
 app.set('trust proxy', 1);
@@ -30,7 +42,6 @@ const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY || 'sb_publishable_itAVU
 const CATEGORIES = ['gaming','freestyle','dance','singing','music','sports','art','photography','cosplay','other'];
 const MODES = ['video','audio','photo','local'];
 const AGE_BRACKETS = ['13_17','18_plus'];
-const REPORT_HIDE_THRESHOLD = 3;
 const ARBITER_CLOSE_VOTES = 30;
 const MIN_VOTES = 10;
 const MIN_DIFF = 3;
@@ -39,13 +50,11 @@ const SHARE_REWARD_MILESTONES = parseMilestones(process.env.SHARE_REWARD_MILESTO
 const SHARE_BASE_URL = (process.env.SHARE_BASE_URL || process.env.FRONTEND_ORIGIN || '').replace(/\/$/, '');
 const SHARE_TOKEN_SECRET = process.env.SHARE_TOKEN_SECRET || 'aura_share_secret_default_key';
 
-// Mercado Pago Setup
-const mpClient = new MercadoPagoConfig({ accessToken: process.env.MP_ACCESS_TOKEN || '' });
 const PRICING = {
-  starter: { points: 50, price: 2000, title: '50 Puntos Regalables — AURA STAR' },
-  plus:    { points: 120, price: 4500, title: '120 Puntos Regalables — AURA STAR' },
-  pro:     { points: 300, price: 10000, title: '300 Puntos Regalables — AURA STAR' },
-  mega:    { points: 700, price: 22000, title: '700 Puntos Regalables — AURA STAR' }
+  starter: { points: 50, price: 2000, title: '50 Estrellas Aura — AURA STAR' },
+  plus:    { points: 120, price: 4500, title: '120 Estrellas Aura — AURA STAR' },
+  pro:     { points: 300, price: 10000, title: '300 Estrellas Aura — AURA STAR' },
+  mega:    { points: 700, price: 22000, title: '700 Estrellas Aura — AURA STAR' }
 };
 
 function parseMilestones(raw) {
@@ -125,16 +134,20 @@ async function settleBattle(client, b, vc, vo, forcedWinner = null) {
   return winnerId;
 }
 
-app.get('/', (req,res) => res.json({ app:'AURA STAR', version:'5.5', status:'ok' }));
+app.get('/', (req,res) => res.json({ app:'AURA STAR', version:'5.7', status:'ok' }));
 
 // MERCADO PAGO: Crear Checkout Pro
 app.post('/api/payments/create-checkout', auth, async (req, res) => {
+  if (!Preference || !process.env.MP_ACCESS_TOKEN) {
+    return res.status(500).json({ error: 'Mercado Pago no está configurado en el servidor.' });
+  }
+
   const packageId = req.body?.package_id;
   const pack = PRICING[packageId];
-  if (!pack) return res.status(400).json({ error: 'Paquete de puntos inválido.' });
+  if (!pack) return res.status(400).json({ error: 'Paquete inválido.' });
 
   try {
-    const preference = new Preference(mpClient);
+    const preference = new Preference(mpClient || new MercadoPagoConfig({ accessToken: process.env.MP_ACCESS_TOKEN }));
     const result = await preference.create({
       body: {
         items: [{
@@ -160,16 +173,16 @@ app.post('/api/payments/create-checkout', auth, async (req, res) => {
     res.json({ init_point: result.init_point });
   } catch (e) {
     console.error('Error MP Preference:', e);
-    res.status(500).json({ error: 'No se pudo generar el checkout de Mercado Pago.' });
+    res.status(500).json({ error: 'No se pudo generar el checkout.' });
   }
 });
 
-// MERCADO PAGO: Webhook de Acreditación
+// MERCADO PAGO: Webhook
 app.post('/api/payments/webhook', async (req, res) => {
   const { type, data } = req.body || {};
-  if (type === 'payment' && data?.id) {
+  if (type === 'payment' && data?.id && Payment && process.env.MP_ACCESS_TOKEN) {
     try {
-      const payment = new Payment(mpClient);
+      const payment = new Payment(mpClient || new MercadoPagoConfig({ accessToken: process.env.MP_ACCESS_TOKEN }));
       const payInfo = await payment.get({ id: data.id });
 
       if (payInfo.status === 'approved') {
@@ -188,7 +201,56 @@ app.post('/api/payments/webhook', async (req, res) => {
   res.sendStatus(200);
 });
 
-// CREAR/ACTUALIZAR USUARIO
+// REGALAR ESTRELLAS AURA (DESCUENTA ESTRELLAS AL EMISOR -> SUMA AURA AL CREADOR)
+app.post('/api/users/gift-stars', auth, rateLimit({ windowMs: 60000, max: 15 }), async (req, res) => {
+  const { target_identifier, method, points } = req.body || {};
+  const amount = Number(points);
+
+  if (!Number.isInteger(amount) || amount < 1) {
+    return res.status(400).json({ error: 'La cantidad de estrellas debe ser mayor a 0.' });
+  }
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    // Emisor
+    const sender = await getActiveUser(client, req.userId, true);
+    if (!sender || sender.is_banned) throw Error('Tu cuenta no está disponible.');
+    if (sender.giftable_points < amount) throw Error('No tenés suficientes Estrellas Aura.');
+
+    // Destinatario
+    let query = 'SELECT id, username FROM users WHERE deleted_at IS NULL AND is_banned = false AND ';
+    let param = target_identifier?.trim();
+
+    if (method === 'qr' || method === 'id') {
+      query += 'id = $1';
+    } else {
+      param = param?.replace(/^@/, '');
+      query += 'LOWER(username) = LOWER($1)';
+    }
+
+    const recipientQ = await client.query(query, [param]);
+    const recipient = recipientQ.rows[0];
+
+    if (!recipient) throw Error('No encontramos al usuario destinatario.');
+    if (recipient.id === req.userId) throw Error('No podés regalarte estrellas a vos mismo.');
+
+    // Descuento Estrellas Aura al emisor -> Acredita Puntos de Aura al destinatario
+    await client.query('UPDATE users SET giftable_points = giftable_points - $1 WHERE id = $2', [amount, req.userId]);
+    await client.query('UPDATE users SET aura_points = aura_points + $1 WHERE id = $2', [amount, recipient.id]);
+
+    await client.query('COMMIT');
+    res.json({ message: `¡Le enviaste +${amount} Aura a @${recipient.username}!`, remaining: sender.giftable_points - amount });
+  } catch (e) {
+    await client.query('ROLLBACK');
+    res.status(400).json({ error: e.message });
+  } finally {
+    client.release();
+  }
+});
+
+// USUARIOS, BATALLAS Y MODERACIÓN...
 app.post('/api/users', auth, rateLimit({windowMs:60000,max:20}), async (req,res) => {
   const username = typeof req.body?.username === 'string' ? req.body.username.trim().slice(0,40) : null;
   const age = req.body?.age_bracket;
@@ -202,10 +264,9 @@ app.post('/api/users', auth, rateLimit({windowMs:60000,max:20}), async (req,res)
       [req.userId,username,age || null]
     );
     res.json(q.rows[0]);
-  } catch(e){ console.error(e); res.status(500).json({error:'No se pudo guardar el usuario'}); }
+  } catch(e){ res.status(500).json({error:'No se pudo guardar el usuario'}); }
 });
 
-// RANKING PÚBLICO
 app.get('/api/users/ranking', async (req,res) => {
   try {
     const q = await pool.query(`SELECT id,username,aura_points,
@@ -215,7 +276,6 @@ app.get('/api/users/ranking', async (req,res) => {
   } catch(e){ res.status(500).json({error:'No se pudo cargar el ranking'}); }
 });
 
-// OBTENER MI PERFIL
 app.get('/api/users/:id', auth, async (req,res) => {
   if(req.params.id!==req.userId) return res.status(403).json({error:'No autorizado'});
   try {
@@ -230,24 +290,6 @@ app.get('/api/users/:id', auth, async (req,res) => {
   }
 });
 
-// ELIMINAR MI CUENTA
-app.delete('/api/users/:id', auth, async (req,res) => {
-  if(req.params.id!==req.userId) return res.status(403).json({error:'No autorizado'});
-  const client = await pool.connect();
-  try {
-    await client.query('BEGIN');
-    const q = await client.query(`UPDATE users SET username=('deleted_'||substr(id,1,8)),is_banned=true,deleted_at=NOW() WHERE id=$1 AND deleted_at IS NULL RETURNING id`, [req.userId]);
-    if(!q.rowCount) throw Error('Usuario no encontrado');
-    await client.query(`UPDATE battles SET status='cancelled',closed_at=NOW() WHERE status='active' AND (creator_id=$1 OR opponent_id=$1 OR local_participant_a=$1 OR local_participant_b=$1)`, [req.userId]);
-    await client.query('COMMIT');
-    res.json({message:'Cuenta eliminada'});
-  } catch(e) {
-    await client.query('ROLLBACK');
-    res.status(400).json({error:e.message});
-  } finally { client.release(); }
-});
-
-// FEED DE BATALLAS
 app.get('/api/battles', async (req,res) => {
   const limit = Math.min(Math.max(parseInt(req.query.limit,10)||30,1),50);
   try {
@@ -273,7 +315,6 @@ app.get('/api/battles', async (req,res) => {
   }
 });
 
-// OBTENER DETALLE DE BATALLA POR ID
 app.get('/api/battles/:id', async (req, res) => {
   if(!isUuid(req.params.id)) return res.status(400).json({error:'ID de batalla inválido'});
   try {
@@ -294,7 +335,6 @@ app.get('/api/battles/:id', async (req, res) => {
   }
 });
 
-// CREAR BATALLA
 app.post('/api/battles', auth, rateLimit({windowMs:60000,max:20}), async (req,res) => {
   const mode = String(req.body?.mode||'video');
   const category = String(req.body?.category||'');
@@ -336,7 +376,6 @@ app.post('/api/battles', auth, rateLimit({windowMs:60000,max:20}), async (req,re
   } finally { client.release(); }
 });
 
-// UNIRSE A BATALLA MULTIMEDIA
 app.post('/api/battles/:id/join', auth, rateLimit({windowMs:60000,max:20}), async (req,res) => {
   const url = req.body?.media_url_opponent || req.body?.media_url;
   if(!validateMediaUrl(url)) return res.status(400).json({error:'La participación es obligatoria.'});
@@ -360,7 +399,6 @@ app.post('/api/battles/:id/join', auth, rateLimit({windowMs:60000,max:20}), asyn
   } finally { client.release(); }
 });
 
-// VOTAR EN BATALLA
 app.post('/api/battles/:id/vote', auth, rateLimit({windowMs:60000,max:30}), async (req,res) => {
   const target = req.body?.voted_user_id;
   if(!isValidId(target)) return res.status(400).json({error:'Participante inválido.'});
@@ -403,169 +441,8 @@ app.post('/api/battles/:id/vote', auth, rateLimit({windowMs:60000,max:30}), asyn
   } finally { client.release(); }
 });
 
-// BÚSQUEDA DE BATALLAS LOCALES
-app.get('/api/battles/local/search', auth, async (req,res) => {
-  const q = typeof req.query.q==='string' ? req.query.q.trim().slice(0,80) : '';
-  if(q.length < 2) return res.json([]);
-  try {
-    const r = await pool.query(
-      `SELECT b.id, b.title, b.votes_creator, b.votes_opponent, b.local_closes_at,
-              ua.username local_a_name, ub.username local_b_name FROM battles b
-       LEFT JOIN users ua ON ua.id=b.local_participant_a 
-       LEFT JOIN users ub ON ub.id=b.local_participant_b
-       WHERE b.mode='local' AND b.status='active' AND b.hidden=false AND b.title ILIKE $1 
-       ORDER BY b.created_at DESC LIMIT 30`,
-      [`%${q}%`]
-    );
-    res.json(r.rows);
-  } catch(e) { res.status(500).json({error:'Error en la búsqueda de batallas.'}); }
-});
-
-// SISTEMA DE REFERIDOS Y COMPARTIR
-app.get('/api/share', auth, async (req,res) => {
-  try {
-    const token = crypto.createHmac('sha256', SHARE_TOKEN_SECRET).update(`aura-share-v2:${req.userId}`).digest('base64url');
-    const tokenHash = sha256(token);
-    await pool.query('INSERT INTO share_invites(user_id,token_hash) VALUES($1,$2) ON CONFLICT(user_id) DO UPDATE SET token_hash=EXCLUDED.token_hash', [req.userId, tokenHash]);
-    const countQ = await pool.query('SELECT COUNT(*)::int count FROM share_referrals WHERE referrer_id=$1', [req.userId]);
-    const awardedQ = await pool.query('SELECT COALESCE(SUM(aura_points),0)::int total FROM share_rewards WHERE user_id=$1', [req.userId]);
-    
-    const count = countQ.rows[0].count;
-    const totalAwarded = awardedQ.rows[0].total;
-    const next = SHARE_REWARD_MILESTONES.find(x => x.users > count) || null;
-    
-    res.json({
-      share_url: `${SHARE_BASE_URL || '/'}/?ref=${encodeURIComponent(token)}`,
-      verified_users: count,
-      total_aura_awarded: totalAwarded,
-      next_milestone: next,
-      milestones: SHARE_REWARD_MILESTONES
-    });
-  } catch(e) {
-    res.status(500).json({error: 'No se pudo preparar el enlace de compartir'});
-  }
-});
-
-// TEST DE AURA INICIAL
-app.post('/api/users/aura-test', auth, rateLimit({ windowMs: 60000, max: 5 }), async (req, res) => {
-  const client = await pool.connect();
-  try {
-    await client.query('BEGIN');
-    const u = await getActiveUser(client, req.userId, true);
-    if (!u) throw Error('Usuario no encontrado.');
-    if (u.aura_test_completed) throw Error('Ya realizaste tu test de Aura inicial.');
-
-    const min = Number(req.body?.score_min) || 20;
-    const max = Number(req.body?.score_max) || 100;
-    const randomAura = Math.floor(Math.random() * (max - min + 1)) + min;
-
-    await client.query(
-      `UPDATE users SET aura_points = aura_points + $1, aura_test_completed = true WHERE id = $2`,
-      [randomAura, req.userId]
-    );
-
-    await client.query(
-      `INSERT INTO aura_tests(user_id,answers,camera_used,credited_aura)
-       VALUES($1,$2,$3,$4) ON CONFLICT(user_id) DO NOTHING`,
-      [req.userId, JSON.stringify(req.body?.answers || []), Boolean(req.body?.camera_used), randomAura]
-    );
-
-    await client.query('COMMIT');
-    res.json({ credited_aura: randomAura, total_aura: u.aura_points + randomAura });
-  } catch (e) {
-    await client.query('ROLLBACK');
-    res.status(400).json({ error: e.message });
-  } finally {
-    client.release();
-  }
-});
-
-// RUTAS DE MODERACIÓN / ADMIN
-async function requireAdmin(req,res,next){
-  try{
-    const q = await pool.query(`SELECT is_admin,moderation_role FROM users WHERE id=$1 AND deleted_at IS NULL`,[req.userId]);
-    const u = q.rows[0];
-    if(!u || !(u.is_admin===true || u.moderation_role==='admin')) return res.status(403).json({error:'Acceso denegado: permisos requeridos.'});
-    next();
-  }catch(e){ res.status(500).json({error:'Error al verificar permisos.'}); }
-}
-
-app.get('/api/admin/summary', auth, requireAdmin, async (req,res) => {
-  try {
-    const [u, b, a] = await Promise.all([
-      pool.query(`SELECT COUNT(*)::int count FROM users WHERE deleted_at IS NULL`),
-      pool.query(`SELECT COUNT(*)::int count FROM battles WHERE status='active' AND hidden=false`),
-      pool.query(`SELECT COALESCE(SUM(amount),0)::int total FROM admin_audit_logs WHERE action_type='GRANT_AURA' AND created_at>=date_trunc('day',NOW())`)
-    ]);
-    res.json({users: u.rows[0].count, active_battles: b.rows[0].count, aura_granted_today: a.rows[0].total});
-  } catch(e) { res.status(500).json({error:'Error al cargar el resumen.'}); }
-});
-
-app.get('/api/admin/users/search', auth, requireAdmin, async (req,res) => {
-  const q = String(req.query.q||'').trim();
-  if(q.length < 2) return res.json([]);
-  try {
-    const r = await pool.query(
-      `SELECT id,username,aura_points,giftable_points,is_banned,is_test_account,moderation_role,is_organizer,created_at
-       FROM users WHERE deleted_at IS NULL AND (username ILIKE $1 OR id=$2) ORDER BY created_at DESC LIMIT 20`,
-      [`%${q}%`, q]
-    );
-    res.json(r.rows);
-  } catch(e) { res.status(500).json({error:'Error en la búsqueda.'}); }
-});
-
-app.post('/api/admin/grant-points', auth, requireAdmin, async (req,res) => {
-  const target = String(req.body?.target_user_id||'');
-  const type = req.body?.type==='giftable' ? 'giftable' : 'aura';
-  const points = Number(req.body?.points);
-  const reason = typeof req.body?.reason==='string' ? req.body.reason.trim().slice(0,200) : '';
-  if(!isValidId(target) || !Number.isInteger(points) || points < 1 || points > 1000) return res.status(400).json({error:'Cantidad inválida (1-1000).'});
-  if(target === req.userId) return res.status(400).json({error:'No podés otorgarte puntos a vos mismo.'});
-  const client = await pool.connect();
-  try {
-    await client.query('BEGIN');
-    const field = type==='giftable' ? 'giftable_points' : 'aura_points';
-    await client.query(`UPDATE users SET ${field}=${field}+$1 WHERE id=$2`, [points, target]);
-    await client.query(`INSERT INTO admin_audit_logs(admin_id,target_user_id,action_type,amount,reason) VALUES($1,$2,$3,$4,$5)`, [req.userId, target, `GRANT_${type.toUpperCase()}`, points, reason||'Premio']);
-    await client.query('COMMIT');
-    res.json({message:'Puntos otorgados correctamente.'});
-  } catch(e) {
-    await client.query('ROLLBACK');
-    res.status(400).json({error: e.message});
-  } finally { client.release(); }
-});
-
-// ELIMINAR BATALLA (ADMIN)
-app.delete('/api/admin/battles/:id', auth, requireAdmin, async (req, res) => {
-  const battleId = req.params.id;
-  if (!isUuid(battleId)) return res.status(400).json({ error: 'ID de batalla inválido.' });
-  
-  const client = await pool.connect();
-  try {
-    await client.query('BEGIN');
-    await client.query('DELETE FROM votes WHERE battle_id = $1', [battleId]);
-    await client.query('DELETE FROM reports WHERE battle_id = $1', [battleId]);
-    
-    const r = await client.query('DELETE FROM battles WHERE id = $1 RETURNING id, title', [battleId]);
-    if (!r.rowCount) throw new Error('La batalla no existe o ya fue eliminada.');
-    
-    await client.query(
-      `INSERT INTO admin_audit_logs(admin_id, action_type, reason) VALUES($1, 'DELETE_BATTLE', $2)`,
-      [req.userId, `Borrado de batalla ID: ${battleId}`]
-    );
-    
-    await client.query('COMMIT');
-    res.json({ message: '🗑️ Batalla eliminada correctamente.' });
-  } catch (e) {
-    await client.query('ROLLBACK');
-    res.status(400).json({ error: e.message });
-  } finally {
-    client.release();
-  }
-});
-
 app.use((err,req,res,next) => { console.error(err); res.status(500).json({error:'Error de servidor'}); });
 app.use((req,res) => res.status(404).json({error:'Ruta no encontrada'}));
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`AURA STAR API v5.5 en puerto ${PORT}`));
+app.listen(PORT, () => console.log(`AURA STAR API v5.7 en puerto ${PORT}`));
