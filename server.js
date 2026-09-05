@@ -30,11 +30,6 @@ const CATEGORIES = ['gaming','freestyle','dance','singing','music','sports','art
 const MODES = ['video','audio','photo','local'];
 const AGE_BRACKETS = ['13_17','18_plus'];
 const REPORT_HIDE_THRESHOLD = 3;
-const DAILY_GIFT_LIMIT_PER_RECIPIENT = 50;
-const POINTS_PER_AD = 5;
-const DAILY_AD_POINTS_CAP = 60;
-const LOCAL_COST = 0;
-const TOURNAMENT_COST = Number(process.env.TOURNAMENT_COST || 0);
 const ARBITER_CLOSE_VOTES = 30;
 const MIN_VOTES = 10;
 const MIN_DIFF = 3;
@@ -42,13 +37,6 @@ const MIN_DIFF = 3;
 const SHARE_REWARD_MILESTONES = parseMilestones(process.env.SHARE_REWARD_MILESTONES || '5:5,10:10,25:25');
 const SHARE_BASE_URL = (process.env.SHARE_BASE_URL || process.env.FRONTEND_ORIGIN || '').replace(/\/$/, '');
 const SHARE_TOKEN_SECRET = process.env.SHARE_TOKEN_SECRET || 'aura_share_secret_default_key';
-
-const PRODUCTS = {
-  starter: { points: 50 },
-  plus: { points: 120 },
-  pro: { points: 300 },
-  mega: { points: 700 }
-};
 
 function parseMilestones(raw) {
   const out = raw.split(',').map(x => x.trim()).map(x => {
@@ -104,7 +92,30 @@ async function activeBattleCount(client, userId) {
 
 function validateMediaUrl(v) { return typeof v === 'string' && /^https:\/\//i.test(v) && v.length <= 2048; }
 
-app.get('/', (req,res) => res.json({ app:'AURA STAR', version:'5.2', status:'ok' }));
+function winnerFor(b, vc, vo) {
+  const pa = b.mode === 'local' ? b.local_participant_a : b.creator_id;
+  const pb = b.mode === 'local' ? b.local_participant_b : b.opponent_id;
+  if (!pb || vc === vo || vc + vo < MIN_VOTES || Math.abs(vc - vo) < MIN_DIFF) return null;
+  return vc > vo ? pa : pb;
+}
+
+async function settleBattle(client, b, vc, vo, forcedWinner = null) {
+  const winnerId = forcedWinner || winnerFor(b, vc, vo);
+  if (!winnerId) return null;
+  const pa = b.mode === 'local' ? b.local_participant_a : b.creator_id;
+  const pb = b.mode === 'local' ? b.local_participant_b : b.opponent_id;
+  const loserId = winnerId === pa ? pb : pa;
+  
+  await client.query('UPDATE users SET aura_points=aura_points+20 WHERE id=$1', [winnerId]);
+  if (loserId) await client.query('UPDATE users SET aura_points=GREATEST(0,aura_points-5) WHERE id=$1', [loserId]);
+  await client.query(
+    `UPDATE battles SET votes_creator=$1,votes_opponent=$2,status='completed',winner_id=$3,closed_at=NOW() WHERE id=$4`,
+    [vc, vo, winnerId, b.id]
+  );
+  return winnerId;
+}
+
+app.get('/', (req,res) => res.json({ app:'AURA STAR', version:'5.3', status:'ok' }));
 
 // CREAR/ACTUALIZAR USUARIO
 app.post('/api/users', auth, rateLimit({windowMs:60000,max:20}), async (req,res) => {
@@ -252,6 +263,87 @@ app.post('/api/battles', auth, rateLimit({windowMs:60000,max:20}), async (req,re
     await client.query('ROLLBACK');
     res.status(400).json({error: e.message});
   } finally { client.release(); }
+});
+
+// UNIRSE A BATALLA MULTIMEDIA
+app.post('/api/battles/:id/join', auth, rateLimit({windowMs:60000,max:20}), async (req,res) => {
+  const url = req.body?.media_url_opponent || req.body?.media_url;
+  if(!validateMediaUrl(url)) return res.status(400).json({error:'La participación es obligatoria.'});
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const user = await getActiveUser(client, req.userId, true);
+    if (!user || user.is_banned) throw Error('Cuenta no disponible.');
+    const q = await client.query('SELECT * FROM battles WHERE id=$1 FOR UPDATE', [req.params.id]);
+    const b = q.rows[0];
+    if(!b || b.status!=='active') throw Error('La batalla no está activa.');
+    if(b.creator_id === req.userId) throw Error('No podés unirte a tu propia batalla.');
+    if(b.opponent_id) throw Error('La batalla ya tiene oponente.');
+    
+    const r = await client.query(`UPDATE battles SET opponent_id=$1, media_url_opponent=$2 WHERE id=$3 RETURNING *`, [req.userId, url, req.params.id]);
+    await client.query('COMMIT');
+    res.json(r.rows[0]);
+  } catch(e) {
+    await client.query('ROLLBACK');
+    res.status(400).json({error: e.message});
+  } finally { client.release(); }
+});
+
+// VOTAR EN BATALLA
+app.post('/api/battles/:id/vote', auth, rateLimit({windowMs:60000,max:30}), async (req,res) => {
+  const target = req.body?.voted_user_id;
+  if(!isValidId(target)) return res.status(400).json({error:'Participante inválido.'});
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const voter = await getActiveUser(client, req.userId, true);
+    if(!voter || voter.is_banned) throw Error('Cuenta suspendida.');
+    
+    const q = await client.query('SELECT * FROM battles WHERE id=$1 FOR UPDATE', [req.params.id]);
+    const b = q.rows[0];
+    if(!b || b.status!=='active') throw Error('La batalla no está activa.');
+    
+    const pa = b.mode === 'local' ? b.local_participant_a : b.creator_id;
+    const pb = b.mode === 'local' ? b.local_participant_b : b.opponent_id;
+    
+    if(req.userId === pa || req.userId === pb) throw Error('No podés votar en tu propia batalla.');
+    if(target !== pa && target !== pb) throw Error('Participante inválido.');
+    
+    const prior = await client.query('SELECT 1 FROM votes WHERE battle_id=$1 AND voter_id=$2', [b.id, req.userId]);
+    if(prior.rowCount) throw Error('Ya votaste en esta batalla.');
+    
+    await client.query('INSERT INTO votes(battle_id, voter_id, voted_user_id) VALUES($1,$2,$3)', [b.id, req.userId, target]);
+    
+    const vc = Number(b.votes_creator) + (target === pa ? 1 : 0);
+    const vo = Number(b.votes_opponent) + (target === pb ? 1 : 0);
+    
+    const winner = await settleBattle(client, b, vc, vo);
+    if(!winner) await client.query('UPDATE battles SET votes_creator=$1, votes_opponent=$2 WHERE id=$3', [vc, vo, b.id]);
+    
+    await client.query('COMMIT');
+    res.json({message: 'Voto registrado correctamente', votes_creator: vc, votes_opponent: vo, total_votes: vc + vo, completed: Boolean(winner), winner_id: winner});
+  } catch(e) {
+    await client.query('ROLLBACK');
+    res.status(400).json({error: e.message});
+  } finally { client.release(); }
+});
+
+// BÚSQUEDA DE BATALLAS LOCALES
+app.get('/api/battles/local/search', auth, async (req,res) => {
+  const q = typeof req.query.q==='string' ? req.query.q.trim().slice(0,80) : '';
+  if(q.length < 2) return res.json([]);
+  try {
+    const r = await pool.query(
+      `SELECT b.id, b.title, b.votes_creator, b.votes_opponent, b.local_closes_at,
+              ua.username local_a_name, ub.username local_b_name FROM battles b
+       LEFT JOIN users ua ON ua.id=b.local_participant_a 
+       LEFT JOIN users ub ON ub.id=b.local_participant_b
+       WHERE b.mode='local' AND b.status='active' AND b.hidden=false AND b.title ILIKE $1 
+       ORDER BY b.created_at DESC LIMIT 30`,
+      [`%${q}%`]
+    );
+    res.json(r.rows);
+  } catch(e) { res.status(500).json({error:'Error en la búsqueda de batallas.'}); }
 });
 
 // SISTEMA DE REFERIDOS Y COMPARTIR
@@ -404,4 +496,4 @@ app.use((err,req,res,next) => { console.error(err); res.status(500).json({error:
 app.use((req,res) => res.status(404).json({error:'Ruta no encontrada'}));
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`AURA STAR API v5.2 en puerto ${PORT}`));
+app.listen(PORT, () => console.log(`AURA STAR API v5.3 en puerto ${PORT}`));
